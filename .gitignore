@@ -12,3 +12,4 @@ vfec_results/
 *.log
 *.csv
 *.json
+*.gcov
