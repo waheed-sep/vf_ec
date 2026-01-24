@@ -1,0 +1,26 @@
+FROM ubuntu:24.04
+
+# Install Dependencies (includes 'file', 'meson', 'ninja-build')
+RUN apt-get update && apt-get install -y \
+    build-essential rsync wget curl \
+    python3 python3-dev libdw-dev libunwind-dev \
+    flex bison git pkg-config libelf-dev libtraceevent-dev python3-pip \
+    libzip-dev libssl-dev libuv1-dev meson ninja-build file \
+    && rm -rf /var/lib/apt/lists/* \
+    && git clone --depth 1 https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git \
+    && cd linux/tools/perf \
+    && NO_JEVENTS=1 make \
+    && cp perf /usr/bin \
+    && cd / && rm -rf linux
+
+COPY requirements.txt /app/
+RUN pip3 install --no-cache-dir --break-system-packages -r /app/requirements.txt
+
+WORKDIR /app
+
+# [FIX] Updated to the new official organization URL (radareorg)
+RUN git clone https://github.com/radareorg/radare2.git /app/inputs/radare2
+
+COPY radare2_pipeline.py /app/
+
+CMD ["python3", "radare2_pipeline.py"]

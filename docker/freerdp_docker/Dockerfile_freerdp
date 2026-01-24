@@ -1,0 +1,33 @@
+# [FIX] Downgraded to Ubuntu 20.04 to support OpenSSL 1.1.x for older FreeRDP commits
+FROM ubuntu:20.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Install VFEC Core + FreeRDP Specific Dependencies
+# FreeRDP requires: cmake, OpenSSL, X11 libraries, Wayland, ALSA/PulseAudio, FFmpeg, CUPS, PCSC
+RUN apt-get update && apt-get install -y \
+    build-essential rsync wget curl \
+    python3 python3-dev libdw-dev libunwind-dev \
+    flex bison git pkg-config libelf-dev python3-pip \
+    cmake libssl-dev libx11-dev libxext-dev libxcursor-dev libxi-dev \
+    libxinerama-dev libxrandr-dev libxss-dev libxv-dev libxkbcommon-dev \
+    libwayland-dev libasound2-dev libpulse-dev libcups2-dev \
+    libpcsclite-dev libusb-1.0-0-dev libavcodec-dev libavutil-dev \
+    && rm -rf /var/lib/apt/lists/* \
+    && git clone --depth 1 https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git \
+    && cd linux/tools/perf \
+    && NO_JEVENTS=1 NO_LIBTRACEEVENT=1 make \
+    && cp perf /usr/bin \
+    && cd / && rm -rf linux
+
+COPY requirements.txt /app/
+RUN pip3 install --no-cache-dir -r /app/requirements.txt
+
+WORKDIR /app
+
+# Download FreeRDP Repo
+RUN git clone https://github.com/FreeRDP/FreeRDP.git /app/inputs/freerdp
+
+COPY freerdp_pipeline.py /app/
+
+CMD ["python3", "freerdp_pipeline.py"]

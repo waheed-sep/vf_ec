@@ -1,0 +1,29 @@
+FROM ubuntu:24.04
+
+# 1. Install Dependencies
+# ADDED: autoconf, automake, libtool (CRITICAL for fixing "autoconf not found")
+RUN apt-get update && apt-get install -y \
+    build-essential rsync wget curl \
+    python3 python3-dev libdw-dev libunwind-dev \
+    flex bison git pkg-config libelf-dev libtraceevent-dev python3-pip \
+    libjpeg-dev libpng-dev libtiff-dev libgif-dev libwebp-dev \
+    libfreetype6-dev libfontconfig1-dev ghostscript libxml2-dev \
+    autoconf automake libtool \
+    && rm -rf /var/lib/apt/lists/* \
+    && git clone --depth 1 https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git \
+    && cd linux/tools/perf \
+    && NO_JEVENTS=1 make \
+    && cp perf /usr/bin \
+    && cd / && rm -rf linux
+
+COPY requirements.txt /app/
+RUN pip3 install --no-cache-dir --break-system-packages -r /app/requirements.txt
+
+WORKDIR /app
+
+# Download ImageMagick6 Repo
+RUN git clone https://github.com/ImageMagick/ImageMagick6.git /app/inputs/ImageMagick6
+
+COPY imagemagick6_pipeline.py /app/
+
+CMD ["python3", "imagemagick6_pipeline.py"]

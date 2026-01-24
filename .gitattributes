@@ -1,0 +1,2 @@
+*.log filter=lfs diff=lfs merge=lfs -text
+vfec_results/vim_output/log/pipeline_execution.log filter=lfs diff=lfs merge=lfs -text

@@ -1,0 +1,14 @@
+/curl_results
+/ds_projects
+clone_log.txt
+microsoft.gpg
+vfec_results/log_tc_results.txt
+.~lock*
+*.gcda
+*.log
+primevul_dataset/
+vfec_results/
+*.xlsx
+*.log
+*.csv
+*.json
