@@ -37,7 +37,7 @@ class ProgressBar:
 # ==========================================
 # CONFIGURATION
 # ==========================================
-REPO_NAME = "ghostpdl" # [UPDATED]
+REPO_NAME = "ghostpdl" 
 TARGET_DURATION_SEC = 2.0
 CSV_WRITE_INTERVAL = 50
 TEST_LIMIT = None
@@ -54,7 +54,8 @@ INPUT_CSV = os.path.join(INPUT_DIR, "cwe_projects.csv")
 PROJECT_DIR = os.path.join(INPUT_DIR, REPO_NAME)
 LOG_DIR = os.path.join(OUTPUT_DIR, "log")
 CACHE_DIR = os.path.join(LOG_DIR, "cache")
-GCDA_DIR = os.path.join(OUTPUT_DIR, "gcda_files")
+# We keep the name GCDA_DIR for config consistency, but it will now store .gcov text files
+GCDA_DIR = os.path.join(OUTPUT_DIR, "gcda_files") 
 
 ITERATIONS = 5
 DEFAULT_TIMEOUT_MS = 2000
@@ -74,7 +75,6 @@ def run_command(command, cwd, ignore_errors=False):
     try:
         env = os.environ.copy()
         env["LC_ALL"] = "C"
-        # [MAINTAINED] errors='replace' to handle any bad encoding output from the tests
         result = subprocess.run(command, cwd=cwd, shell=True, env=env,
                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True, errors='replace')
         if result.returncode != 0 and not ignore_errors:
@@ -128,15 +128,13 @@ def get_covered_files(cwd):
     return list(covered)
 
 # ==========================================
-# [UPDATED] GHOSTPDL SPECIFIC
+# GHOSTPDL SPECIFIC
 # ==========================================
 def configure_ghostpdl(cwd, coverage=False):
-    # Some older GhostPDL commits require autogen.sh
     if not os.path.exists(os.path.join(cwd, "configure")):
         if not run_command("./autogen.sh", cwd):
             logging.error("Failed to run autogen.sh")
 
-    # Disable GUI components so tests run fully headless
     config_args = [
         "./configure",
         "--without-x",
@@ -158,17 +156,14 @@ def build_ghostpdl(cwd):
     return run_command("make -j$(nproc)", cwd)
 
 def get_ghostpdl_tests(cwd):
-    # Ghostscript renders standard internal test/help targets
     tests = [
         {
             "name": "ghostscript-help-render",
-            # Standard ghostscript basic execution test (headless)
             "cmd": "./bin/gs -dNODISPLAY -dBATCH -dNOPAUSE -h",
             "type": "suite"
         },
         {
             "name": "ghostscript-pdf-render",
-            # This forces the PDF rendering engine to execute internally without X11
             "cmd": "./bin/gs -dNODISPLAY -dBATCH -dNOPAUSE -sDEVICE=pdfwrite -sOutputFile=/dev/null -f examples/tiger.eps || true",
             "type": "suite"
         }
@@ -214,17 +209,23 @@ def process_commit(commit: str, coverage: bool = True):
         covered = get_covered_files(PROJECT_DIR)
         test['covered_files'] = covered
         
-        # [MAINTAINED] HIERARCHICAL GCDA FOLDERS (Per your preference)
+        # [NEW] AUTOMATED GCOV GENERATION
+        # Runs gcov on every covered source file right inside the container.
+        for source_file in covered:
+            # -p flag preserves the file path in the name to prevent collision
+            run_command(f"gcov -p {source_file}", PROJECT_DIR, ignore_errors=True)
+
         # Creates: output/gcda_files/commit_hash/test_name/
         test_safe_name = t['name'].replace(" ", "_").replace("/", "_")
-        test_gcda_dir = os.path.join(GCDA_DIR, commit[:8], test_safe_name)
-        os.makedirs(test_gcda_dir, exist_ok=True)
+        test_gcov_dir = os.path.join(GCDA_DIR, commit[:8], test_safe_name)
+        os.makedirs(test_gcov_dir, exist_ok=True)
 
-        # Copy gcda files into the specific test folder for this commit
-        run_command(f"find . -name '*.gcda' -exec cp {{}} {test_gcda_dir}/ \\;", PROJECT_DIR)
+        # [FIX] Copy the human-readable .gcov files instead of the binary .gcda files
+        run_command(f"find . -name '*.gcov' -exec cp {{}} {test_gcov_dir}/ \\;", PROJECT_DIR)
 
         # Clean up internal files
         run_command("find . -name '*.gcda' -delete", PROJECT_DIR)
+        run_command("find . -name '*.gcov' -delete", PROJECT_DIR)
 
         commit_results['tests'].append(test)
         
@@ -349,7 +350,6 @@ def measure_test(pkg_event, test, commit):
         wrapped_cmd = _wrap_until_timeout(test["cmd"], timeout_ms)
         perf_argv = ["perf", "stat", "-a", "-e", f"{perf_events}", "-x,", "--output", perf_out, "--", "sh", "-c", wrapped_cmd]
 
-        # [MAINTAINED] errors='replace' to prevent encoding crashes
         res = subprocess.run(perf_argv, cwd=PROJECT_DIR, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, errors='replace')
         
         if res.returncode != 0: 
