@@ -1,0 +1,31 @@
+# Using Ubuntu 20.04 for compatibility with legacy LibRaw C++ standards
+FROM ubuntu:20.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Install VFEC Core + LibRaw Specific Dependencies
+# [FIX] Replaced deprecated 'libjasper-dev' with the modern 'libopenjp2-7-dev'
+RUN apt-get update && apt-get install -y \
+    build-essential rsync wget curl \
+    python3 python3-dev libdw-dev libunwind-dev \
+    flex bison git pkg-config libelf-dev python3-pip \
+    autoconf automake libtool autopoint \
+    liblcms2-dev libopenjp2-7-dev libjpeg-dev zlib1g-dev \
+    && rm -rf /var/lib/apt/lists/* \
+    && git clone --depth 1 https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git \
+    && cd linux/tools/perf \
+    && NO_JEVENTS=1 NO_LIBTRACEEVENT=1 make \
+    && cp perf /usr/bin \
+    && cd / && rm -rf linux
+
+COPY requirements.txt /app/
+RUN pip3 install --no-cache-dir -r /app/requirements.txt
+
+WORKDIR /app
+
+# Download LibRaw Repo
+RUN git clone https://github.com/LibRaw/LibRaw.git /app/inputs/libraw
+
+COPY libraw_pipeline.py /app/
+
+CMD ["python3", "libraw_pipeline.py"]
