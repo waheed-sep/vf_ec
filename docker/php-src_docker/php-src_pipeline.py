@@ -37,12 +37,11 @@ class ProgressBar:
 # ==========================================
 # CONFIGURATION
 # ==========================================
-REPO_NAME = "php-src" # UPDATED
+REPO_NAME = "php-src" 
 TARGET_DURATION_SEC = 2.0
 CSV_WRITE_INTERVAL = 50
 TEST_LIMIT = None
 
-# [KEEP] Updated URL
 GIST_CSV_URL = "https://gist.githubusercontent.com/waheed-sep/935cfc1ba42b2475d45336a4c779cbc8/raw/cwe_projects.csv"
 
 # ==========================================
@@ -71,7 +70,6 @@ def setup_logging():
     LOG_FILE = os.path.join(LOG_DIR, "pipeline_execution.log")
     logging.basicConfig(filename=LOG_FILE, level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-# [KEEP] Exact Original
 def run_command(command, cwd, ignore_errors=False):
     try:
         env = os.environ.copy()
@@ -117,16 +115,14 @@ def get_git_diff_files(cwd, commit_hash):
     result = subprocess.run(cmd, cwd=cwd, shell=True, stdout=subprocess.PIPE, text=True)
     return {f for f in result.stdout.strip().split('\n') if f}
 
-def get_covered_files(cwd):
-    covered = set()
+# [UPDATED] Replaced get_covered_files with standard get_gcda_files for .gcov generation
+def get_gcda_files(cwd):
+    gcda_files = []
     for root, dirs, files in os.walk(cwd):
         for file in files:
             if file.endswith(".gcda"):
-                source_name = file.replace(".gcda", ".c")
-                rel_dir = os.path.relpath(root, cwd)
-                full_path = source_name if rel_dir == "." else os.path.join(rel_dir, source_name)
-                covered.add(full_path)
-    return list(covered)
+                gcda_files.append(os.path.join(root, file))
+    return gcda_files
 
 def flush_buffer_to_csv(filepath, buffer, fieldnames):
     if not buffer: return
@@ -144,9 +140,12 @@ def flush_buffer_to_csv(filepath, buffer, fieldnames):
         logging.error(f"Failed to write CSV: {e}")
 
 # ==========================================
-# [UPDATED] PHP-SRC SPECIFIC
+# PHP-SRC SPECIFIC
 # ==========================================
 def configure_php(cwd, coverage=False):
+    # Ensure a fresh state before buildconf
+    run_command("git clean -fdx", cwd)
+    
     # PHP requires buildconf to generate the configure script first
     if not run_command("./buildconf --force", cwd):
         logging.error("buildconf failed")
@@ -170,8 +169,8 @@ def configure_php(cwd, coverage=False):
     if coverage:
         cflags += " --coverage"
 
-    # Inject CFLAGS
-    full_cmd = f'CFLAGS="{cflags}" {" ".join(config_args)}'
+    # [FIX] Forced YACC=bison to fix the yystpcpy / %pure_parser compilation errors
+    full_cmd = f'YACC=bison CFLAGS="{cflags}" {" ".join(config_args)}'
     
     return run_command(full_cmd, cwd)
 
@@ -183,17 +182,12 @@ def build_php(cwd):
 
 def get_php_tests(cwd):
     tests = []
-    # PHP tests are .phpt files found in tests/, Zend/, ext/
-    # We walk the directory to find them.
     for root, dirs, files in os.walk(cwd):
         for f in files:
             if f.endswith(".phpt"):
                 t_name = f[:-5] # remove .phpt
                 rel_path = os.path.relpath(os.path.join(root, f), cwd)
                 
-                # Command to run a single test via make
-                # NO_INTERACTION=1 prevents it from asking to send reports to PHP.net
-                # TESTS=path points to the specific file
                 cmd = f"NO_INTERACTION=1 make test TESTS='{rel_path}'"
                 
                 tests.append({
@@ -206,7 +200,7 @@ def get_php_tests(cwd):
     return tests
 
 # ==========================================
-# PHASE 1 & 2 LOGIC (Exact Copy of OpenSSL)
+# PHASE 1 & 2 LOGIC 
 # ==========================================
 
 def process_commit(commit: str, coverage: bool = True) -> (dict | None):
@@ -216,11 +210,9 @@ def process_commit(commit: str, coverage: bool = True) -> (dict | None):
     
     commit_results = { "hash": commit, "tests": [] }
 
-    # [UPDATED CALLS]
     if not configure_php(PROJECT_DIR, coverage=coverage): return None
     if not build_php(PROJECT_DIR): return None
     
-    # [UPDATED CALL]
     suite = get_php_tests(PROJECT_DIR)
     print(f"\nRunning {len(suite)} tests...")
 
@@ -244,15 +236,41 @@ def process_commit(commit: str, coverage: bool = True) -> (dict | None):
             commit_results['tests'].append(test)
             continue
         
-        covered = get_covered_files(PROJECT_DIR)
-        test['covered_files'] = covered
+        # [UPDATED] Feature addition: .c.gcov file generation and storage
+        gcda_files = get_gcda_files(PROJECT_DIR)
+        for gcda in gcda_files:
+            gcda_dir = os.path.dirname(gcda)
+            gcda_name = os.path.basename(gcda)
+
+            if os.path.basename(gcda_dir) == ".libs":
+                work_dir = os.path.dirname(gcda_dir)
+                obj_dir = ".libs"
+            else:
+                work_dir = gcda_dir
+                obj_dir = "."
+
+            run_command(f"gcov -p --object-directory {obj_dir} {gcda_name}", cwd=work_dir, ignore_errors=True)
+
+        test['covered_files'] = [os.path.basename(f) for f in gcda_files]
+
+        # Creates: output/gcda_files/commit_hash/test_name/
+        test_safe_name = t['name'].replace(" ", "_").replace("/", "_")
+        test_gcov_dir = os.path.join(GCDA_DIR, commit[:8], test_safe_name)
+        os.makedirs(test_gcov_dir, exist_ok=True)
+
+        # Copy human-readable .gcov files
+        run_command(f"find . -name '*.gcov' -exec cp {{}} {test_gcov_dir}/ \\;", PROJECT_DIR)
+
+        # Clean up
+        run_command("find . -name '*.gcda' -delete", PROJECT_DIR)
+        run_command("find . -name '*.gcov' -delete", PROJECT_DIR)
+
         commit_results['tests'].append(test)
         
     return commit_results
 
 def prepare_for_energy_measurement():
     print("\nPreparing project for energy measurement...")
-    # [UPDATED CALLS]
     configure_php(PROJECT_DIR, coverage=False)
     build_php(PROJECT_DIR)
     
@@ -311,17 +329,20 @@ def run_phase_1_coverage(vuln, fix):
     return coverage_results
     
 def extract_test_covering_git_changes(coverage_results, target_files):  
-    for target in target_files:
-        for test in coverage_results.get('tests', []):
-            if coverage_results.get('failed', {}).get('status', True):
-                continue
-        
-            for test in coverage_results.get('tests', []):
-                covered_files = test.get('covered_files', [])
-                test['keep'] = target in covered_files
+    # [FIX] Implemented base-name intersection logic to ensure test['keep'] triggers correctly
+    target_bases = {os.path.splitext(os.path.basename(f))[0] for f in target_files}
+
+    for test in coverage_results.get('tests', []):
+        if test.get('failed', False):
+            test['keep'] = False
+            continue
+
+        covered_bases = {os.path.splitext(f)[0] for f in test.get('covered_files', [])}
+        has_overlap = len(target_bases.intersection(covered_bases)) > 0
+        test['keep'] = has_overlap
 
 # ==========================================
-# PHASE 2: ENERGY (Exact Copy of OpenSSL)
+# PHASE 2: ENERGY
 # ==========================================
 def detect_rapl(perf_bin="perf"):
     cmd = [perf_bin, "list", "--no-desc"]
@@ -372,7 +393,7 @@ def measure_test(pkg_event, test, commit):
 
     for iteration in range(ITERATIONS):
         pb.set(iteration)
-        perf_out = os.path.join(perf_dir, f"{commit}_{test.get('name')}__{iteration}.csv")
+        perf_out = os.path.join(perf_dir, f"{commit}_{test.get('name')}___iter{iteration}.csv")
         wrapped_cmd = _wrap_until_timeout(test["cmd"], timeout_ms)
         perf_argv = ["perf", "stat", "-a", "-e", f"{perf_events}", "-x,", "--output", perf_out, "--", "sh", "-c", wrapped_cmd]
 
@@ -394,7 +415,7 @@ def read_configuration():
         except Exception: pass
 
 # ==========================================
-# MAIN (Fixed CSV & Logic)
+# MAIN
 # ==========================================
 def main():
     prepare_directories()
