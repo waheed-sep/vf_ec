@@ -133,16 +133,44 @@ def get_gcda_files(cwd):
                 gcda_files.append(os.path.join(root, file))
     return gcda_files
 
-def patch_powf64_error(cwd):
+def force_patch_powf64(cwd):
     """
-    Fixes the 'ambiguous powf64' error by renaming LibRaw's internal function
-    to 'libraw_powf64' so it doesn't conflict with the system math library.
+    Aggressively finds and renames 'powf64' to 'libraw_powf64' 
+    to prevent conflicts with the system math library.
     """
-    dcraw_path = os.path.join(cwd, "internal", "dcraw_common.cpp")
-    if os.path.exists(dcraw_path):
-        # We use sed to replace all occurrences of 'powf64' with 'libraw_powf64'
-        # This fixes the ambiguity.
-        run_command("sed -i 's/powf64/libraw_powf64/g' internal/dcraw_common.cpp", cwd)
+    # Look for the file in common LibRaw locations
+    candidates = [
+        os.path.join(cwd, "internal", "dcraw_common.cpp"),
+        os.path.join(cwd, "src", "dcraw_common.cpp"),
+        os.path.join(cwd, "dcraw_common.cpp")
+    ]
+    
+    patched = False
+    for fpath in candidates:
+        if os.path.exists(fpath):
+            try:
+                # Read the file
+                with open(fpath, 'r', encoding='utf-8', errors='ignore') as f:
+                    content = f.read()
+                
+                # Check if it needs patching
+                if 'powf64' in content:
+                    logging.info(f"Found 'powf64' in {fpath}. Patching...")
+                    # Replace definitions and calls
+                    new_content = content.replace('powf64', 'libraw_powf64')
+                    
+                    # Write it back
+                    with open(fpath, 'w', encoding='utf-8') as f:
+                        f.write(new_content)
+                    logging.info("SUCCESS: Patched 'powf64' to 'libraw_powf64'.")
+                    patched = True
+                else:
+                    logging.info(f"Checked {fpath}: No 'powf64' found (already patched?).")
+            except Exception as e:
+                logging.error(f"Failed to patch {fpath}: {e}")
+
+    if not patched:
+        logging.warning("WARNING: Could not find 'dcraw_common.cpp' to patch.")
 
 # ==========================================
 # LIBRAW SPECIFIC
@@ -218,9 +246,9 @@ def process_commit(commit: str, coverage: bool = True):
     run_command(f"git checkout -f {commit}", PROJECT_DIR)
     
     run_command("git submodule update --init --recursive", PROJECT_DIR)
-    
-    # [NEW] Apply patch to fix compilation error
-    patch_powf64_error(PROJECT_DIR)
+
+    # 2. Apply Patch IMMEDIATELY AFTER Checkout
+    force_patch_powf64(PROJECT_DIR)
 
     commit_results = { "hash": commit, "tests": [] }
 
@@ -247,19 +275,13 @@ def process_commit(commit: str, coverage: bool = True):
             commit_results['tests'].append(test)
             continue
         
+        # [UPDATED] GCOV LOOP
+        # We process files from the Project Root so gcov can find the source code
         gcda_files = get_gcda_files(PROJECT_DIR)
         for gcda in gcda_files:
-            gcda_dir = os.path.dirname(gcda)
-            gcda_name = os.path.basename(gcda)
-
-            if os.path.basename(gcda_dir) == ".libs":
-                work_dir = os.path.dirname(gcda_dir)
-                obj_dir = ".libs"
-            else:
-                work_dir = gcda_dir
-                obj_dir = "."
-
-            run_command(f"gcov -p --object-directory {obj_dir} {gcda_name}", cwd=work_dir, ignore_errors=True)
+            # We pass the absolute path to the .gcda file
+            # We run from PROJECT_DIR so relative source paths (e.g. 'internal/dcraw.c') resolve correctly
+            run_command(f"gcov -p {gcda}", cwd=PROJECT_DIR, ignore_errors=True)
 
         test['covered_files'] = [os.path.basename(f) for f in gcda_files]
 
@@ -267,8 +289,11 @@ def process_commit(commit: str, coverage: bool = True):
         test_gcov_dir = os.path.join(GCDA_DIR, commit[:8], test_safe_name)
         os.makedirs(test_gcov_dir, exist_ok=True)
 
-        run_command(f"find . -name '*.gcov' -exec cp {{}} {test_gcov_dir}/ \\;", PROJECT_DIR)
+        # [UPDATED] Move files from Project Root
+        # Because we ran gcov in PROJECT_DIR, the .gcov files are generated there
+        run_command(f"find . -maxdepth 1 -name '*.gcov' -exec mv {{}} {test_gcov_dir}/ \\;", PROJECT_DIR)
 
+        # Cleanup
         run_command("find . -name '*.gcda' -delete", PROJECT_DIR)
         run_command("find . -name '*.gcov' -delete", PROJECT_DIR)
 
@@ -294,7 +319,7 @@ def run_phase_1_coverage(vuln, fix):
     if not run_command(f"git checkout -f {fix}", PROJECT_DIR): return None
     
     # [NEW] Apply patch for FIX commit
-    patch_powf64_error(PROJECT_DIR)
+    force_patch_powf64(PROJECT_DIR)
 
     git_changed_files= get_git_diff_files(PROJECT_DIR, fix)
     if not git_changed_files: return None
