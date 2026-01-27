@@ -114,7 +114,7 @@ def download_csv_if_missing():
     raw_sample = os.path.join(INPUT_DIR, "sample.cr2")
     if not os.path.exists(raw_sample):
         print("Downloading sample CR2 raw image for workload...")
-        raw_url = "https://raw.githubusercontent.com/LibRaw/LibRaw-cmake/master/RawSamples/canon_eos_350d_1.cr2"
+        raw_url = "https://raw.githubusercontent.com/waheed-sep/vf_ec/main/docker/libraw_docker/sample.cr2"
         try:
             urllib.request.urlretrieve(raw_url, raw_sample)
         except Exception as e:
@@ -133,13 +133,26 @@ def get_gcda_files(cwd):
                 gcda_files.append(os.path.join(root, file))
     return gcda_files
 
+def patch_powf64_error(cwd):
+    """
+    Fixes the 'ambiguous powf64' error by renaming LibRaw's internal function
+    to 'libraw_powf64' so it doesn't conflict with the system math library.
+    """
+    dcraw_path = os.path.join(cwd, "internal", "dcraw_common.cpp")
+    if os.path.exists(dcraw_path):
+        # We use sed to replace all occurrences of 'powf64' with 'libraw_powf64'
+        # This fixes the ambiguity.
+        run_command("sed -i 's/powf64/libraw_powf64/g' internal/dcraw_common.cpp", cwd)
+
 # ==========================================
 # LIBRAW SPECIFIC
 # ==========================================
 def configure_libraw(cwd, coverage=False):
+    # Ensure autotools files exist
     if not os.path.exists(os.path.join(cwd, "configure")):
         if not run_command("autoreconf -i", cwd):
             logging.error("Failed to run autoreconf")
+            return False
 
     config_args = [
         "./configure",
@@ -147,17 +160,38 @@ def configure_libraw(cwd, coverage=False):
         "--disable-shared"
     ]
 
-    # [FIX] Added -std=gnu++98 to fix older legacy LibRaw C++ errors (like std::auto_ptr)
-    flags = "-O0 -Wno-narrowing -fpermissive -std=gnu++98"
-    libs = "-lstdc++" 
-    
-    if coverage:
-        flags += " --coverage"
-        libs += " -lgcov" 
-    
-    full_cmd = f'CC=g++ CXX=g++ CFLAGS="{flags}" CXXFLAGS="{flags}" LDFLAGS="{flags}" LIBS="{libs}" {" ".join(config_args)}'
-    
-    return run_command(full_cmd, cwd)
+    # Fallback: try multiple C++ standards
+    std_candidates = ["gnu++98", "gnu++11", "gnu++14"]
+
+    for std in std_candidates:
+        # Base flags (include Wno-error to avoid warnings stopping build)
+        flags = f"-O0 -Wno-error -Wno-narrowing -fpermissive -std={std}"
+        libs = "-lstdc++"
+
+        if coverage:
+            flags += " --coverage"
+            libs += " -lgcov"
+
+        # Clean configure cache between attempts (important!)
+        run_command("rm -f config.cache", cwd, ignore_errors=True)
+
+        full_cmd = (
+            f'CC=g++ CXX=g++ '
+            f'CFLAGS="{flags}" CXXFLAGS="{flags}" LDFLAGS="{flags}" '
+            f'LIBS="{libs}" {" ".join(config_args)}'
+        )
+
+        logging.info(f"Trying configure with -std={std} (coverage={coverage})")
+        if run_command(full_cmd, cwd):
+            logging.info(f"Configure succeeded with -std={std}")
+            return True
+
+        logging.warning(f"Configure failed with -std={std}")
+
+    logging.error("Configure failed for all fallback C++ standards.")
+    return False
+
+
 
 def build_libraw(cwd):
     return run_command("make -j$(nproc)", cwd)
@@ -185,6 +219,9 @@ def process_commit(commit: str, coverage: bool = True):
     
     run_command("git submodule update --init --recursive", PROJECT_DIR)
     
+    # [NEW] Apply patch to fix compilation error
+    patch_powf64_error(PROJECT_DIR)
+
     commit_results = { "hash": commit, "tests": [] }
 
     if not configure_libraw(PROJECT_DIR, coverage=coverage): return None
@@ -256,6 +293,9 @@ def run_phase_1_coverage(vuln, fix):
     clean_repo(PROJECT_DIR)
     if not run_command(f"git checkout -f {fix}", PROJECT_DIR): return None
     
+    # [NEW] Apply patch for FIX commit
+    patch_powf64_error(PROJECT_DIR)
+
     git_changed_files= get_git_diff_files(PROJECT_DIR, fix)
     if not git_changed_files: return None
     
