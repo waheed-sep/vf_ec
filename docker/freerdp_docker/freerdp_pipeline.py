@@ -127,6 +127,15 @@ def get_covered_files(cwd):
                 covered.add(full_path)
     return list(covered)
 
+# [NEW] Helper to list .gcda files for the GCOV loop
+def get_gcda_files(cwd):
+    gcda_files = []
+    for root, dirs, files in os.walk(cwd):
+        for file in files:
+            if file.endswith(".gcda"):
+                gcda_files.append(os.path.join(root, file))
+    return gcda_files
+
 # ==========================================
 # FREERDP SPECIFIC
 # ==========================================
@@ -210,11 +219,25 @@ def process_commit(commit: str, coverage: bool = True):
         covered = get_covered_files(PROJECT_DIR)
         test['covered_files'] = covered
         
-        # [FIX] Added double slash (\\) to escape semicolon for Python 3.12 syntax check
-        run_command(f"find . -name '*.gcda' -exec cp {{}} {GCDA_DIR}/ \\;", PROJECT_DIR)
+        # [UPDATED] GCOV GENERATION LOGIC
+        # 1. Prepare specific output directory for this test
+        test_safe_name = t['name'].replace(" ", "_").replace("/", "_")
+        test_gcov_dir = os.path.join(GCDA_DIR, commit[:8], test_safe_name)
+        os.makedirs(test_gcov_dir, exist_ok=True)
 
-        # Clean up internal files
+        # 2. Run gcov on all generated .gcda files
+        gcda_files_list = get_gcda_files(PROJECT_DIR)
+        for gcda in gcda_files_list:
+            # We run from PROJECT_DIR to ensure source paths (often relative) are resolved correctly
+            run_command(f"gcov -p {gcda}", cwd=PROJECT_DIR, ignore_errors=True)
+
+        # 3. Move resulting .gcov files to the output folder
+        # We use -maxdepth 1 because gcov outputs to the current directory (PROJECT_DIR)
+        run_command(f"find . -maxdepth 1 -name '*.gcov' -exec mv {{}} {test_gcov_dir}/ \\;", PROJECT_DIR)
+
+        # 4. Cleanup internal intermediate files
         run_command("find . -name '*.gcda' -delete", PROJECT_DIR)
+        run_command("find . -name '*.gcov' -delete", PROJECT_DIR)
 
         commit_results['tests'].append(test)
         
