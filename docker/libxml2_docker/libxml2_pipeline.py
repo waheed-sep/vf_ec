@@ -37,7 +37,7 @@ class ProgressBar:
 # ==========================================
 # CONFIGURATION
 # ==========================================
-REPO_NAME = "libxml2" # [UPDATED]
+REPO_NAME = "libxml2" 
 TARGET_DURATION_SEC = 2.0
 CSV_WRITE_INTERVAL = 50
 TEST_LIMIT = None
@@ -118,6 +118,7 @@ def get_git_diff_files(cwd, commit_hash):
     return {f for f in result.stdout.strip().split('\n') if f}
 
 def get_covered_files(cwd):
+    # This helper is used to determine which files were touched (for the 'keep' logic)
     covered = set()
     for root, dirs, files in os.walk(cwd):
         for file in files:
@@ -127,17 +128,24 @@ def get_covered_files(cwd):
                 full_path = source_name if rel_dir == "." else os.path.join(rel_dir, source_name)
                 covered.add(full_path)
     return list(covered)
+    
+def get_gcda_files(cwd):
+    # Helper to get the actual list of .gcda file paths for processing
+    gcda_files = []
+    for root, dirs, files in os.walk(cwd):
+        for file in files:
+            if file.endswith(".gcda"):
+                gcda_files.append(os.path.join(root, file))
+    return gcda_files
 
 # ==========================================
-# [UPDATED] LIBXML2 SPECIFIC
+# LIBXML2 SPECIFIC
 # ==========================================
 def configure_libxml2(cwd, coverage=False):
-    # Libxml2 often requires regenerating configure scripts from autogen.sh
     if not os.path.exists(os.path.join(cwd, "configure")):
         if not run_command("./autogen.sh", cwd):
             logging.error("Failed to run autogen.sh")
 
-    # Disabled python to prevent binding failures on old commits
     config_args = [
         "./configure",
         "--without-python", 
@@ -160,7 +168,6 @@ def build_libxml2(cwd):
     return run_command("make -j$(nproc)", cwd)
 
 def get_libxml2_tests(cwd):
-    # Libxml2 has 'runtest' and 'runsuite' executables
     tests = [
         {
             "name": "libxml2-runtest",
@@ -211,20 +218,31 @@ def process_commit(commit: str, coverage: bool = True):
             commit_results['tests'].append(test)
             continue
         
+        # 1. Identify covered files for 'keep' logic
         covered = get_covered_files(PROJECT_DIR)
         test['covered_files'] = covered
         
-        # [NEW HIERARCHICAL GCDA FOLDERS]
-        # Creates: output/gcda_files/commit_hash/test_name/
+        # 2. Prepare output directory
         test_safe_name = t['name'].replace(" ", "_").replace("/", "_")
-        test_gcda_dir = os.path.join(GCDA_DIR, commit[:8], test_safe_name)
-        os.makedirs(test_gcda_dir, exist_ok=True)
+        test_gcov_dir = os.path.join(GCDA_DIR, commit[:8], test_safe_name)
+        os.makedirs(test_gcov_dir, exist_ok=True)
 
-        # Copy gcda files into the specific test folder for this commit
-        run_command(f"find . -name '*.gcda' -exec cp {{}} {test_gcda_dir}/ \\;", PROJECT_DIR)
+        # 3. [UPDATED] Run GCOV to generate .c.gcov files
+        # We process files from the Project Root so gcov can find the source code
+        gcda_files_list = get_gcda_files(PROJECT_DIR)
+        
+        for gcda in gcda_files_list:
+            # Run gcov on the absolute path of the gcda file
+            # Executed from PROJECT_DIR to resolve source paths correctly
+            run_command(f"gcov -p {gcda}", cwd=PROJECT_DIR, ignore_errors=True)
 
-        # Clean up internal files
+        # 4. Move the generated .gcov files to the output folder
+        # 'find' with -maxdepth 1 because gcov outputs them in the current working directory (PROJECT_DIR)
+        run_command(f"find . -maxdepth 1 -name '*.gcov' -exec mv {{}} {test_gcov_dir}/ \\;", PROJECT_DIR)
+
+        # 5. Cleanup
         run_command("find . -name '*.gcda' -delete", PROJECT_DIR)
+        run_command("find . -name '*.gcov' -delete", PROJECT_DIR)
 
         commit_results['tests'].append(test)
         
