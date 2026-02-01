@@ -37,7 +37,7 @@ class ProgressBar:
 # ==========================================
 # CONFIGURATION
 # ==========================================
-REPO_NAME = "jasper" # UPDATED
+REPO_NAME = "jasper" 
 TARGET_DURATION_SEC = 2.0
 CSV_WRITE_INTERVAL = 50
 TEST_LIMIT = None
@@ -126,6 +126,15 @@ def get_covered_files(cwd):
                 covered.add(full_path)
     return list(covered)
 
+# [NEW] Helper to list .gcda files for the GCOV loop
+def get_gcda_files(cwd):
+    gcda_files = []
+    for root, dirs, files in os.walk(cwd):
+        for file in files:
+            if file.endswith(".gcda"):
+                gcda_files.append(os.path.join(root, file))
+    return gcda_files
+
 def flush_buffer_to_csv(filepath, buffer, fieldnames):
     if not buffer: return
     file_exists = os.path.exists(filepath)
@@ -142,20 +151,22 @@ def flush_buffer_to_csv(filepath, buffer, fieldnames):
         logging.error(f"Failed to write CSV: {e}")
 
 # ==========================================
-# [UPDATED] JASPER SPECIFIC
+# JASPER SPECIFIC
 # ==========================================
 def configure_jasper(cwd, coverage=False):
-    flags = "-O0"
+    # [FIX] Legacy C flags to prevent crashes on old commits
+    # -fpermissive: Downgrade const/type errors to warnings
+    # -w: Suppress all warnings so -Werror doesn't trigger
+    flags = "-O0 -fpermissive -w -Wno-error"
     libs = ""
     
     if coverage:
         flags += " --coverage"
-        libs = "-lgcov" # Link gcov
+        libs = "-lgcov" 
 
     # Check if modern CMake or old Autotools
     if os.path.exists(os.path.join(cwd, "CMakeLists.txt")):
         # Modern: CMake
-        # JAS_ENABLE_PROGRAMS ensures test binaries and CLI apps are built
         cmake_cmd = (
             f'cmake -B build -S . '
             f'-DCMAKE_C_FLAGS="{flags}" '
@@ -187,14 +198,12 @@ def get_jasper_tests(cwd):
     build_dir = os.path.join(cwd, "build")
     if os.path.exists(build_dir):
         # Modern CMake: Extract individual tests from CTest
-        # 'ctest -N' lists tests like "Test #1: testname"
         res = subprocess.run(["ctest", "-N"], cwd=build_dir, capture_output=True, text=True)
         for line in res.stdout.splitlines():
             if "Test #" in line:
                 parts = line.split(":")
                 if len(parts) >= 2:
                     test_name = parts[1].strip()
-                    # Run that specific test
                     tests.append({
                         "name": test_name,
                         "cmd": f"cd build && ctest -R '^{test_name}$' --output-on-failure",
@@ -242,6 +251,7 @@ def process_commit(commit: str, coverage: bool = True) -> (dict | None):
             "covered_files": []
         }
 
+        # Clear old gcda
         run_command("find . -name '*.gcda' -delete", PROJECT_DIR)
         
         if not run_command(test.get('cmd'), PROJECT_DIR):
@@ -252,6 +262,29 @@ def process_commit(commit: str, coverage: bool = True) -> (dict | None):
         
         covered = get_covered_files(PROJECT_DIR)
         test['covered_files'] = covered
+
+        # [FIX] ROBUST GCOV GENERATION (Samba-Style)
+        # 1. Prepare output directory
+        test_safe_name = t['name'].replace(" ", "_").replace("/", "_")
+        test_gcov_dir = os.path.join(GCDA_DIR, commit[:8], test_safe_name)
+        os.makedirs(test_gcov_dir, exist_ok=True)
+
+        # 2. Run gcov from the DIRECTORY of the .gcda file
+        gcda_files_list = get_gcda_files(PROJECT_DIR)
+        for gcda in gcda_files_list:
+            gcda_dir = os.path.dirname(gcda)
+            gcda_file = os.path.basename(gcda)
+            
+            # Run gcov inside the specific subdirectory to resolve source paths
+            run_command(f"gcov -p {gcda_file}", cwd=gcda_dir, ignore_errors=True)
+            
+            # Move the generated .gcov files
+            run_command(f"find . -maxdepth 1 -name '*.gcov' -exec mv {{}} {test_gcov_dir}/ \\;", cwd=gcda_dir)
+
+        # 4. Cleanup internal intermediate files
+        run_command("find . -name '*.gcda' -delete", PROJECT_DIR)
+        run_command("find . -name '*.gcov' -delete", PROJECT_DIR)
+        
         commit_results['tests'].append(test)
         
     return commit_results
@@ -259,7 +292,7 @@ def process_commit(commit: str, coverage: bool = True) -> (dict | None):
 def prepare_for_energy_measurement():
     print("\nPreparing project for energy measurement...")
     
-    # [FIX] Clean previous build artifacts completely
+    # Clean previous build artifacts completely
     run_command("make clean", PROJECT_DIR)
     run_command("rm -rf build", PROJECT_DIR) # For CMake
     
@@ -298,9 +331,9 @@ def run_phase_1_coverage(vuln, fix):
     rapl_pkg = detect_rapl()
     kept_tests = [t for t in coverage_results['fix_commit'].get('tests', []) if t.get('keep', True) and not t.get('failed', True)]
 
-    prepare_for_energy_measurement()
-    for test in kept_tests:
-        measure_test(rapl_pkg, test, fix)
+    # prepare_for_energy_measurement()
+    # for test in kept_tests:
+    #     measure_test(rapl_pkg, test, fix)
 
     # VULN COMMIT
     coverage_results['vuln_commit'] = process_commit(vuln)
@@ -314,9 +347,9 @@ def run_phase_1_coverage(vuln, fix):
     
     kept_tests = [t for t in coverage_results.get('vuln_commit', {}).get('tests', []) if t.get('keep', True) and not t.get('failed', True)]
     
-    prepare_for_energy_measurement()
-    for test in kept_tests:
-        measure_test(rapl_pkg, test, vuln)
+    # prepare_for_energy_measurement()
+    # for test in kept_tests:
+    #     measure_test(rapl_pkg, test, vuln)
 
     return coverage_results
     
