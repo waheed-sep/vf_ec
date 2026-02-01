@@ -1,10 +1,13 @@
-# Downgraded to Ubuntu 20.04 to support Python 2 for older Samba Waf scripts
 FROM ubuntu:20.04
 
 ENV DEBIAN_FRONTEND=noninteractive
 
-# Install Dependencies (Including Python 2)
+# 1. Install Dependencies
+# Added explicit library support for Samba
 RUN apt-get update && apt-get install -y \
+    libpopt-dev libreadline-dev zlib1g-dev libssl-dev libncurses5-dev \
+    libsasl2-dev libkrb5-dev liblmdb-dev \
+    libsocket-wrapper libuid-wrapper libnss-wrapper libpam-wrapper \
     build-essential rsync wget curl \
     python3 python3-dev libdw-dev libunwind-dev \
     python2 python2-dev \
@@ -20,16 +23,14 @@ RUN apt-get update && apt-get install -y \
     && cp perf /usr/bin \
     && cd / && rm -rf linux
 
-# Make 'python' point to Python 2 for Samba's configure script
+# 2. Force 'python' to map to Python 2 (Required for old Samba Waf scripts)
 RUN ln -sf /usr/bin/python2 /usr/bin/python
 
 COPY requirements.txt /app/
 RUN pip3 install --no-cache-dir -r /app/requirements.txt
 
 WORKDIR /app
-
 RUN git clone https://github.com/samba-team/samba.git /app/inputs/samba
 
 COPY samba_pipeline.py /app/
-
 CMD ["python3", "samba_pipeline.py"]

@@ -10,7 +10,7 @@ import re
 import shlex
 import yaml
 
-# [KEEP] Project-Independent Helpers (Exact Copy)
+# [KEEP] Project-Independent Helpers
 class ProgressBar:
     def __init__(self, total, length=40, step=1):
         self.total = total
@@ -74,7 +74,6 @@ def run_command(command, cwd, ignore_errors=False):
     try:
         env = os.environ.copy()
         env["LC_ALL"] = "C"
-        # Silent Mode Restored
         result = subprocess.run(command, cwd=cwd, shell=True, env=env,
                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True)
         if result.returncode != 0 and not ignore_errors:
@@ -84,18 +83,6 @@ def run_command(command, cwd, ignore_errors=False):
     except Exception as e:
         logging.error(f"EXCEPTION: {e}")
         return False
-
-def save_json(filepath, data):
-    try:
-        with open(filepath, 'w') as f: json.dump(data, f, indent=4)
-    except Exception as e: logging.error(f"JSON Save Error: {e}")
-
-def load_json(filepath):
-    if os.path.exists(filepath):
-        try:
-            with open(filepath, 'r') as f: return json.load(f)
-        except: return {}
-    return {}
 
 def clean_repo(cwd):
     run_command("git reset --hard", cwd)
@@ -127,9 +114,37 @@ def get_covered_files(cwd):
                 covered.add(full_path)
     return list(covered)
 
+def get_gcda_files(cwd):
+    gcda_files = []
+    for root, dirs, files in os.walk(cwd):
+        for file in files:
+            if file.endswith(".gcda"):
+                gcda_files.append(os.path.join(root, file))
+    return gcda_files
+
 # ==========================================
-# SAMBA SPECIFIC (Dynamic detection + GnuTLS Fix)
+# SAMBA SPECIFIC
 # ==========================================
+
+def patch_waf_perl_script(cwd):
+    for root, dirs, files in os.walk(cwd):
+        if "samba_perl.py" in files:
+            full_path = os.path.join(root, "samba_perl.py")
+            try:
+                with open(full_path, 'r') as f:
+                    content = f.read()
+                if "perl_inc.remove('.')" in content:
+                    new_content = content.replace(
+                        "perl_inc.remove('.')", 
+                        "if '.' in perl_inc: perl_inc.remove('.')"
+                    )
+                    with open(full_path, 'w') as f:
+                        f.write(new_content)
+                    logging.info(f"Patched Waf Perl script: {full_path}")
+                    return 
+            except Exception as e:
+                logging.warning(f"Failed to patch samba_perl.py: {e}")
+
 def configure_samba(cwd, coverage=False):
     config_args = [
         "./configure",
@@ -153,7 +168,7 @@ def configure_samba(cwd, coverage=False):
         if "--without-gnutls" in help_out: config_args.append("--without-gnutls")
         if "--disable-gnutls" in help_out: config_args.append("--disable-gnutls")
 
-    flags = "-O0 -I/usr/include/tirpc"
+    flags = "-O0 -w -I/usr/include/tirpc"
     libs = ""
     
     if coverage:
@@ -176,16 +191,16 @@ def get_samba_tests(cwd):
     return tests
 
 # ==========================================
-# PHASE 1 & 2 LOGIC (Fully Restored)
+# PHASE 1 & 2 LOGIC
 # ==========================================
 
-# Python 3.8 compatible signature
 def process_commit(commit: str, coverage: bool = True):
     logging.info(f"Building {commit[:8]} (Coverage)...")
     clean_repo(PROJECT_DIR)
     run_command(f"git checkout -f {commit}", PROJECT_DIR)
     
     run_command("git submodule update --init --recursive", PROJECT_DIR)
+    patch_waf_perl_script(PROJECT_DIR)
     
     commit_results = { "hash": commit, "tests": [] }
 
@@ -215,11 +230,33 @@ def process_commit(commit: str, coverage: bool = True):
         covered = get_covered_files(PROJECT_DIR)
         test['covered_files'] = covered
         
-        # [FIX] Save .gcda files directly from hidden build dirs to output using native Linux find
-        run_command(f"find . -name '*.gcda' -exec cp {{}} {GCDA_DIR}/ \;", PROJECT_DIR)
+        # [FIX] GCOV GENERATION via bin/default
+        test_safe_name = t['name'].replace(" ", "_").replace("/", "_")
+        test_gcov_dir = os.path.join(GCDA_DIR, commit[:8], test_safe_name)
+        os.makedirs(test_gcov_dir, exist_ok=True)
 
-        # Clean up internal files
+        # Identify Waf build root
+        waf_build_dir = os.path.join(PROJECT_DIR, "bin", "default")
+        gcov_cwd = waf_build_dir if os.path.exists(waf_build_dir) else PROJECT_DIR
+
+        # Gather all GCDAs
+        gcda_files_list = get_gcda_files(gcov_cwd)
+        
+        for gcda in gcda_files_list:
+            # We must pass the path relative to gcov_cwd (bin/default)
+            # e.g., "source4/lib/foo.gcda"
+            rel_gcda = os.path.relpath(gcda, gcov_cwd)
+            
+            # Run gcov INSIDE bin/default
+            # This allows it to resolve "../../source4/foo.c" correctly
+            run_command(f"gcov -p {rel_gcda}", cwd=gcov_cwd, ignore_errors=True)
+            
+            # Move results from bin/default to output
+            run_command(f"find . -maxdepth 1 -name '*.gcov' -exec mv {{}} {test_gcov_dir}/ \\;", cwd=gcov_cwd)
+
+        # Cleanup
         run_command("find . -name '*.gcda' -delete", PROJECT_DIR)
+        run_command("find . -name '*.gcov' -delete", PROJECT_DIR)
 
         commit_results['tests'].append(test)
         
@@ -228,6 +265,7 @@ def process_commit(commit: str, coverage: bool = True):
 def prepare_for_energy_measurement():
     print("\nPreparing project for energy measurement...")
     run_command("make clean", PROJECT_DIR)
+    patch_waf_perl_script(PROJECT_DIR)
     configure_samba(PROJECT_DIR, coverage=False)
     build_samba(PROJECT_DIR)
     
@@ -257,10 +295,10 @@ def run_phase_1_coverage(vuln, fix):
     rapl_pkg = detect_rapl()
     kept_tests = [t for t in coverage_results['fix_commit'].get('tests', []) if t.get('keep', True) and not t.get('failed', True)]
 
-    # PHASE 2 RESTORED
-    prepare_for_energy_measurement()
-    for test in kept_tests:
-        measure_test(rapl_pkg, test, fix)
+    # PHASE 2
+    # prepare_for_energy_measurement()
+    # for test in kept_tests:
+    #     measure_test(rapl_pkg, test, fix)
 
     # VULN COMMIT
     coverage_results['vuln_commit'] = process_commit(vuln)
@@ -273,10 +311,10 @@ def run_phase_1_coverage(vuln, fix):
     
     kept_tests = [t for t in coverage_results.get('vuln_commit', {}).get('tests', []) if t.get('keep', True) and not t.get('failed', True)]
     
-    # PHASE 2 RESTORED
-    prepare_for_energy_measurement()
-    for test in kept_tests:
-        measure_test(rapl_pkg, test, vuln)
+    # PHASE 2
+    # prepare_for_energy_measurement()
+    # for test in kept_tests:
+    #     measure_test(rapl_pkg, test, vuln)
 
     return coverage_results
     
