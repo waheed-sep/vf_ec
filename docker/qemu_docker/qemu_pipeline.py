@@ -37,12 +37,11 @@ class ProgressBar:
 # ==========================================
 # CONFIGURATION
 # ==========================================
-REPO_NAME = "qemu" # UPDATED
+REPO_NAME = "qemu" 
 TARGET_DURATION_SEC = 2.0
 CSV_WRITE_INTERVAL = 50
 TEST_LIMIT = None
 
-# [KEEP] Updated URL
 GIST_CSV_URL = "https://gist.githubusercontent.com/waheed-sep/935cfc1ba42b2475d45336a4c779cbc8/raw/cwe_projects.csv"
 
 # ==========================================
@@ -58,7 +57,7 @@ CACHE_DIR = os.path.join(LOG_DIR, "cache")
 GCDA_DIR = os.path.join(OUTPUT_DIR, "gcda_files")
 
 ITERATIONS = 5
-DEFAULT_TIMEOUT_MS = 5000 # QEMU tests can be slower
+DEFAULT_TIMEOUT_MS = 5000 
 COOL_DOWN_TO_SEC = 1.0
 
 ENERGY_RE = re.compile(r'\bpower/energy-[^/\s]+/?\b')
@@ -71,7 +70,6 @@ def setup_logging():
     LOG_FILE = os.path.join(LOG_DIR, "pipeline_execution.log")
     logging.basicConfig(filename=LOG_FILE, level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-# [KEEP] Exact Original
 def run_command(command, cwd, ignore_errors=False):
     try:
         env = os.environ.copy()
@@ -128,48 +126,56 @@ def get_covered_files(cwd):
                 covered.add(full_path)
     return list(covered)
 
-def flush_buffer_to_csv(filepath, buffer, fieldnames):
-    if not buffer: return
-    file_exists = os.path.exists(filepath)
-    try:
-        with open(filepath, 'a', newline='') as f:
-            writer = csv.writer(f)
-            if not file_exists:
-                writer.writerow(fieldnames)
-            writer.writerows(buffer)
-            f.flush()
-            os.fsync(f.fileno())
-        buffer.clear()
-    except Exception as e:
-        logging.error(f"Failed to write CSV: {e}")
+# [NEW] Helper to list .gcda files
+def get_gcda_files(cwd):
+    gcda_files = []
+    for root, dirs, files in os.walk(cwd):
+        for file in files:
+            if file.endswith(".gcda"):
+                gcda_files.append(os.path.join(root, file))
+    return gcda_files
 
 # ==========================================
-# [UPDATED] QEMU SPECIFIC
+# QEMU SPECIFIC
 # ==========================================
 def configure_qemu(cwd, coverage=False):
-    # QEMU uses a custom ./configure script (not autoconf)
-    # We restrict target-list to x86_64-softmmu to save massive build time
+    # QEMU's ./configure is NOT autoconf. It's a custom python script.
     config_args = [
         "./configure",
         "--target-list=x86_64-softmmu",
-        "--disable-werror", # Prevent build failure on warnings (common in old commits)
+        "--disable-werror",
         "--disable-docs"
     ]
     
-    # QEMU handles coverage flags via its own argument
     if coverage:
         config_args.append("--enable-gcov")
-        # We also inject debug info for better coverage mapping
         config_args.append("--enable-debug")
-    else:
-        # Phase 2: Standard build (usually defaults to -O2 in QEMU)
-        pass
 
     full_cmd = " ".join(config_args)
-    return run_command(full_cmd, cwd)
+    
+    success = run_command(full_cmd, cwd)
+    
+    # [FIX] If configure fails, print config.log to know WHY
+    if not success:
+        log_path = os.path.join(cwd, "config.log")
+        # Modern QEMU puts config.log in build/config.log
+        build_log_path = os.path.join(cwd, "build", "config.log")
+        
+        target_log = log_path if os.path.exists(log_path) else (build_log_path if os.path.exists(build_log_path) else None)
+        
+        if target_log:
+            logging.error(f"--- DUMPING {target_log} ---")
+            try:
+                with open(target_log, 'r') as f:
+                    # Print last 50 lines of config.log
+                    lines = f.readlines()
+                    logging.error("".join(lines[-50:]))
+            except: pass
+            logging.error("--- END CONFIG.LOG ---")
+    
+    return success
 
 def build_qemu(cwd):
-    # QEMU builds with make (which might wrap ninja in newer versions)
     if run_command("make -j$(nproc)", cwd):
         return True
     logging.error("Make failed.")
@@ -177,37 +183,16 @@ def build_qemu(cwd):
 
 def get_qemu_tests(cwd):
     tests = []
-    
-    # QEMU testing structure varies by version, but these top-level targets are stable.
-    # We treat the suites as "Tests" to ensure robustness.
-    
-    # 1. Unit Tests (Core functionality)
-    tests.append({
-        "name": "check-unit",
-        "cmd": "make check-unit",
-        "type": "suite"
-    })
-
-    # 2. QTests for x86_64 (System emulation tests)
-    # This is where most device emulation vulnerabilities are found
-    tests.append({
-        "name": "check-qtest-x86_64",
-        "cmd": "make check-qtest-x86_64",
-        "type": "suite"
-    })
-    
-    # 3. SoftFloat (Math operations, potential CVE source)
-    tests.append({
-        "name": "check-softfloat",
-        "cmd": "make check-softfloat",
-        "type": "suite"
-    })
+    tests.append({ "name": "check-unit", "cmd": "make check-unit", "type": "suite" })
+    tests.append({ "name": "check-qtest-x86_64", "cmd": "make check-qtest-x86_64", "type": "suite" })
+    # Softfloat is useful for numeric vulnerabilities
+    tests.append({ "name": "check-softfloat", "cmd": "make check-softfloat", "type": "suite" })
 
     if TEST_LIMIT and tests: tests = tests[:TEST_LIMIT]
     return tests
 
 # ==========================================
-# PHASE 1 & 2 LOGIC (Exact Copy)
+# PHASE 1 & 2 LOGIC
 # ==========================================
 
 def process_commit(commit: str, coverage: bool = True) -> (dict | None):
@@ -217,11 +202,9 @@ def process_commit(commit: str, coverage: bool = True) -> (dict | None):
     
     commit_results = { "hash": commit, "tests": [] }
 
-    # [UPDATED CALLS]
     if not configure_qemu(PROJECT_DIR, coverage=coverage): return None
     if not build_qemu(PROJECT_DIR): return None
     
-    # [UPDATED CALL]
     suite = get_qemu_tests(PROJECT_DIR)
     print(f"\nRunning {len(suite)} tests...")
 
@@ -239,21 +222,57 @@ def process_commit(commit: str, coverage: bool = True) -> (dict | None):
         # Clean previous coverage data
         run_command("find . -name '*.gcda' -delete", PROJECT_DIR)
         
-        if not run_command(test.get('cmd'), PROJECT_DIR):
-            logging.warning(f"Test Build/Run Failed: {test.get('name')}")
-            test['failed'] = True
-            commit_results['tests'].append(test)
-            continue
+        # Run test (ignore errors)
+        run_command(test.get('cmd'), PROJECT_DIR, ignore_errors=True)
         
         covered = get_covered_files(PROJECT_DIR)
         test['covered_files'] = covered
+
+        # If absolutely no coverage files were created, mark as failed
+        if not covered:
+             logging.warning(f"Test '{test.get('name')}' generated no coverage data.")
+             test['failed'] = True
+
+        # [UPDATED FIX] GCOV Collection Logic for QEMU
+        test_safe_name = t['name'].replace(" ", "_").replace("/", "_")
+        test_gcov_dir = os.path.join(GCDA_DIR, commit[:8], test_safe_name)
+        os.makedirs(test_gcov_dir, exist_ok=True)
+
+        # Detect Build Directory (Newer QEMU uses 'build/', older uses root)
+        build_dir = os.path.join(PROJECT_DIR, "build")
+        if os.path.exists(build_dir):
+            gcov_cwd = build_dir
+        else:
+            gcov_cwd = PROJECT_DIR
+
+        gcda_files_list = get_gcda_files(gcov_cwd)
+        
+        for gcda in gcda_files_list:
+            # We must find the path relative to where we run gcov (gcov_cwd)
+            try:
+                rel_gcda = os.path.relpath(gcda, gcov_cwd)
+            except ValueError:
+                # Fallback if on different drive (unlikely in Linux)
+                rel_gcda = gcda
+
+            # Run gcov from the build dir (if it exists) or root
+            # This allows "../block/blkdebug.c" to resolve correctly
+            run_command(f"gcov -p {rel_gcda}", cwd=gcov_cwd, ignore_errors=True)
+            
+            # Move results
+            run_command(f"find . -maxdepth 1 -name '*.gcov' -exec mv {{}} {test_gcov_dir}/ \\;", cwd=gcov_cwd)
+
+        # Cleanup
+        run_command("find . -name '*.gcda' -delete", PROJECT_DIR)
+        run_command("find . -name '*.gcov' -delete", PROJECT_DIR)
+
         commit_results['tests'].append(test)
         
     return commit_results
 
 def prepare_for_energy_measurement():
     print("\nPreparing project for energy measurement...")
-    # [UPDATED CALLS]
+    run_command("make clean", PROJECT_DIR)
     configure_qemu(PROJECT_DIR, coverage=False)
     build_qemu(PROJECT_DIR)
     
@@ -271,7 +290,6 @@ def run_phase_1_coverage(vuln, fix):
         return None
     
     git_changed_files= get_git_diff_files(PROJECT_DIR, fix)
-    
     if not git_changed_files:
         logging.error("No target files found in git diff.")
         return None
@@ -289,9 +307,9 @@ def run_phase_1_coverage(vuln, fix):
     rapl_pkg = detect_rapl()
     kept_tests = [t for t in coverage_results['fix_commit'].get('tests', []) if t.get('keep', True) and not t.get('failed', True)]
 
-    prepare_for_energy_measurement()
-    for test in kept_tests:
-        measure_test(rapl_pkg, test, fix)
+    # prepare_for_energy_measurement()
+    # for test in kept_tests:
+    #     measure_test(rapl_pkg, test, fix)
 
     # VULN COMMIT
     coverage_results['vuln_commit'] = process_commit(vuln)
@@ -305,9 +323,9 @@ def run_phase_1_coverage(vuln, fix):
     
     kept_tests = [t for t in coverage_results.get('vuln_commit', {}).get('tests', []) if t.get('keep', True) and not t.get('failed', True)]
     
-    prepare_for_energy_measurement()
-    for test in kept_tests:
-        measure_test(rapl_pkg, test, vuln)
+    # prepare_for_energy_measurement()
+    # for test in kept_tests:
+    #     measure_test(rapl_pkg, test, vuln)
 
     return coverage_results
     
