@@ -326,9 +326,9 @@ def run_phase_1_coverage(vuln, fix):
     kept_tests = [t for t in coverage_results['fix_commit'].get('tests', []) if t.get('keep', True) and not t.get('failed', True)]
 
     # PHASE 2 - Energy
-    # prepare_for_energy_measurement()
-    # for test in kept_tests:
-    #     measure_test(rapl_pkg, test, fix)
+    prepare_for_energy_measurement()
+    for test in kept_tests:
+        measure_test(rapl_pkg, test, fix)
 
     # VULN COMMIT
     coverage_results['vuln_commit'] = process_commit(vuln)
@@ -342,9 +342,9 @@ def run_phase_1_coverage(vuln, fix):
     kept_tests = [t for t in coverage_results.get('vuln_commit', {}).get('tests', []) if t.get('keep', True) and not t.get('failed', True)]
 
     # PHASE 2 - Energy
-    # prepare_for_energy_measurement()
-    # for test in kept_tests:
-    #     measure_test(rapl_pkg, test, vuln)
+    prepare_for_energy_measurement()
+    for test in kept_tests:
+        measure_test(rapl_pkg, test, vuln)
 
     return coverage_results
 
