@@ -37,12 +37,11 @@ class ProgressBar:
 # ==========================================
 # CONFIGURATION
 # ==========================================
-REPO_NAME = "vim" # UPDATED
+REPO_NAME = "vim" 
 TARGET_DURATION_SEC = 2.0
 CSV_WRITE_INTERVAL = 50
 TEST_LIMIT = None
 
-# [KEEP] Updated URL
 GIST_CSV_URL = "https://gist.githubusercontent.com/waheed-sep/935cfc1ba42b2475d45336a4c779cbc8/raw/cwe_projects.csv"
 
 # ==========================================
@@ -71,7 +70,6 @@ def setup_logging():
     LOG_FILE = os.path.join(LOG_DIR, "pipeline_execution.log")
     logging.basicConfig(filename=LOG_FILE, level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-# [KEEP] Exact Original
 def run_command(command, cwd, ignore_errors=False):
     try:
         env = os.environ.copy()
@@ -128,6 +126,14 @@ def get_covered_files(cwd):
                 covered.add(full_path)
     return list(covered)
 
+def get_gcda_files(cwd):
+    gcda_files = []
+    for root, dirs, files in os.walk(cwd):
+        for file in files:
+            if file.endswith(".gcda"):
+                gcda_files.append(os.path.join(root, file))
+    return gcda_files
+
 def flush_buffer_to_csv(filepath, buffer, fieldnames):
     if not buffer: return
     file_exists = os.path.exists(filepath)
@@ -144,12 +150,9 @@ def flush_buffer_to_csv(filepath, buffer, fieldnames):
         logging.error(f"Failed to write CSV: {e}")
 
 # ==========================================
-# [UPDATED] VIM SPECIFIC
+# VIM SPECIFIC
 # ==========================================
 def configure_vim(cwd, coverage=False):
-    # Vim configure
-    # --with-features=huge: Enables most features (needed for many tests)
-    # --enable-gui=no --without-x: Disables GUI (Critical for Docker)
     config_args = [
         "./configure",
         "--with-features=huge",
@@ -160,16 +163,13 @@ def configure_vim(cwd, coverage=False):
     cflags = "-O0"
     if coverage:
         cflags += " --coverage"
-        # Often helpful to link coverage too
         config_args.append(f'LDFLAGS="--coverage"')
 
-    # Inject CFLAGS
     full_cmd = f'CFLAGS="{cflags}" {" ".join(config_args)}'
     
     return run_command(full_cmd, cwd)
 
 def build_vim(cwd):
-    # Standard make
     if run_command("make -j$(nproc)", cwd):
         return True
     logging.error("Make failed.")
@@ -177,18 +177,14 @@ def build_vim(cwd):
 
 def get_vim_tests(cwd):
     tests = []
-    # Vim tests are located in src/testdir
     test_dir = os.path.join(cwd, "src", "testdir")
     
     if os.path.exists(test_dir):
-        # Look for test_*.vim files
         try:
             for f in sorted(os.listdir(test_dir)):
                 if f.startswith("test_") and f.endswith(".vim"):
-                    t_name = f[:-4] # remove .vim
-                    
-                    # Vim tests are run by 'make test_name' INSIDE src/testdir
-                    # We use 'cd' in the command string.
+                    t_name = f[:-4]
+                    # Vim tests run inside src/testdir
                     cmd = f"cd src/testdir && make {t_name}"
                     
                     tests.append({
@@ -203,7 +199,7 @@ def get_vim_tests(cwd):
     return tests
 
 # ==========================================
-# PHASE 1 & 2 LOGIC (Exact Copy)
+# PHASE 1 & 2 LOGIC
 # ==========================================
 
 def process_commit(commit: str, coverage: bool = True) -> (dict | None):
@@ -213,11 +209,9 @@ def process_commit(commit: str, coverage: bool = True) -> (dict | None):
     
     commit_results = { "hash": commit, "tests": [] }
 
-    # [UPDATED CALLS]
     if not configure_vim(PROJECT_DIR, coverage=coverage): return None
     if not build_vim(PROJECT_DIR): return None
     
-    # [UPDATED CALL]
     suite = get_vim_tests(PROJECT_DIR)
     print(f"\nRunning {len(suite)} tests...")
 
@@ -235,21 +229,55 @@ def process_commit(commit: str, coverage: bool = True) -> (dict | None):
         # Clean previous coverage data
         run_command("find . -name '*.gcda' -delete", PROJECT_DIR)
         
-        if not run_command(test.get('cmd'), PROJECT_DIR):
-            logging.warning(f"Test Build/Run Failed: {test.get('name')}")
-            test['failed'] = True
-            commit_results['tests'].append(test)
-            continue
+        # Run test
+        run_command(test.get('cmd'), PROJECT_DIR, ignore_errors=True)
         
         covered = get_covered_files(PROJECT_DIR)
         test['covered_files'] = covered
+
+        if not covered:
+             logging.warning(f"Test '{test.get('name')}' generated no coverage data.")
+             test['failed'] = True
+
+        # [NEW] GCOV Collection Logic
+        test_safe_name = t['name'].replace(" ", "_").replace("/", "_")
+        test_gcov_dir = os.path.join(GCDA_DIR, commit[:8], test_safe_name)
+        os.makedirs(test_gcov_dir, exist_ok=True)
+
+        gcda_files_list = get_gcda_files(PROJECT_DIR)
+        
+        # Vim builds inside the 'src' directory.
+        # Paths in .gcda are like "Source: channel.c" (relative to src/)
+        # We must run gcov FROM src/ to find the source files.
+        vim_src_dir = os.path.join(PROJECT_DIR, "src")
+
+        for gcda in gcda_files_list:
+            # Determine correct working directory for gcov
+            if gcda.startswith(vim_src_dir):
+                # If file is in src/ (e.g. src/objects/channel.gcda), run from src/
+                gcov_cwd = vim_src_dir
+                rel_gcda = os.path.relpath(gcda, vim_src_dir)
+            else:
+                # Fallback for files in root
+                gcov_cwd = PROJECT_DIR
+                rel_gcda = os.path.relpath(gcda, PROJECT_DIR)
+
+            # Run gcov
+            run_command(f"gcov -p {rel_gcda}", cwd=gcov_cwd, ignore_errors=True)
+            
+            # Move results
+            run_command(f"find . -maxdepth 1 -name '*.gcov' -exec mv {{}} {test_gcov_dir}/ \\;", cwd=gcov_cwd)
+
+        # Cleanup artifacts so next test starts fresh
+        run_command("find . -name '*.gcda' -delete", PROJECT_DIR)
+        run_command("find . -name '*.gcov' -delete", PROJECT_DIR)
+
         commit_results['tests'].append(test)
         
     return commit_results
 
 def prepare_for_energy_measurement():
     print("\nPreparing project for energy measurement...")
-    # [UPDATED CALLS]
     configure_vim(PROJECT_DIR, coverage=False)
     build_vim(PROJECT_DIR)
     
