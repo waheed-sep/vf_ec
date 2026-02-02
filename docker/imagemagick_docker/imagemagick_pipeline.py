@@ -16,15 +16,20 @@ class ProgressBar:
         self.total = total
         self.length = length
         self.step = step
+        self.current = 0
+
     def update(self, i):
+        self.current = i
         progress = (i + 1) / self.total
         filled = int(self.length * progress)
         bar = '█' * filled + '░' * (self.length - filled)
         print(f"\r[{bar}] {i+1}/{self.total}", end='', flush=True)
+
     def log(self, msg):
         print()
         print(msg)
         self.update(self.current)
+
     def set(self, i):
         self.current = i
         self.update(i)
@@ -32,7 +37,7 @@ class ProgressBar:
 # ==========================================
 # CONFIGURATION
 # ==========================================
-REPO_NAME = "ImageMagick"  # UPDATED
+REPO_NAME = "ImageMagick"
 TARGET_DURATION_SEC = 2.0
 CSV_WRITE_INTERVAL = 50
 TEST_LIMIT = None
@@ -52,7 +57,7 @@ CACHE_DIR = os.path.join(LOG_DIR, "cache")
 GCDA_DIR = os.path.join(OUTPUT_DIR, "gcda_files")
 
 ITERATIONS = 5
-DEFAULT_TIMEOUT_MS = 2000 # Increased slightly for ImageMagick
+DEFAULT_TIMEOUT_MS = 2000
 COOL_DOWN_TO_SEC = 1.0
 
 ENERGY_RE = re.compile(r'\bpower/energy-[^/\s]+/?\b')
@@ -111,16 +116,45 @@ def get_git_diff_files(cwd, commit_hash):
     result = subprocess.run(cmd, cwd=cwd, shell=True, stdout=subprocess.PIPE, text=True)
     return {f for f in result.stdout.strip().split('\n') if f}
 
+# [UPDATED] Robust Libtool Prefix Handling (Fixes JSON paths)
 def get_covered_files(cwd):
     covered = set()
+    # Matches "anything ending in _la-" before the filename
+    libtool_pattern = re.compile(r'^.*_la-(.*\.c)$')
+
     for root, dirs, files in os.walk(cwd):
         for file in files:
             if file.endswith(".gcda"):
-                source_name = file.replace(".gcda", ".c")
+                base_name = file.replace(".gcda", ".c")
+                
+                # Check for Libtool Mangling (e.g., MagickCore_libMagickCore_la-blob.c)
+                match = libtool_pattern.match(base_name)
+                if match:
+                    real_name = match.group(1)
+                else:
+                    real_name = base_name
+
                 rel_dir = os.path.relpath(root, cwd)
-                full_path = source_name if rel_dir == "." else os.path.join(rel_dir, source_name)
+                full_path = real_name if rel_dir == "." else os.path.join(rel_dir, real_name)
+                
+                # Validation check
+                if not os.path.exists(os.path.join(cwd, full_path)):
+                     # Fallback to original if heuristic fails
+                     fallback = base_name if rel_dir == "." else os.path.join(rel_dir, base_name)
+                     if os.path.exists(os.path.join(cwd, fallback)):
+                         full_path = fallback
+
                 covered.add(full_path)
     return list(covered)
+
+# [NEW] Helper for GCOV collection
+def get_gcda_files(cwd):
+    gcda_files = []
+    for root, dirs, files in os.walk(cwd):
+        for file in files:
+            if file.endswith(".gcda"):
+                gcda_files.append(os.path.join(root, file))
+    return gcda_files
 
 def flush_buffer_to_csv(filepath, buffer, fieldnames):
     if not buffer: return
@@ -136,12 +170,15 @@ def flush_buffer_to_csv(filepath, buffer, fieldnames):
     except Exception as e: logging.error(f"Failed to write CSV: {e}")
 
 # ==========================================
-# [UPDATED] IMAGEMAGICK CONFIGURATION & BUILD
+# IMAGEMAGICK CONFIGURATION & BUILD
 # ==========================================
 def configure_imagemagick(cwd, coverage=False):
     # ImageMagick uses Autotools (./configure)
     # We disable OpenMP to ensure stable energy measurements (no multi-threading noise)
     # We disable shared libraries to make the build self-contained
+    if not os.path.exists(os.path.join(cwd, "configure")):
+        run_command("autoreconf -fi", cwd)
+
     config_args = [
         "./configure",
         "--disable-openmp",
@@ -151,13 +188,19 @@ def configure_imagemagick(cwd, coverage=False):
         "--with-quantum-depth=16"
     ]
     
-    # Flags for GCOV coverage
-    cflags = "-O0"
+    cflags = "-O0 -w"
+    libs = ""
+    ldflags = ""
+
     if coverage:
-        cflags += " -fprofile-arcs -ftest-coverage"
+        cflags += " --coverage"
+        # [FIX] Force linker to include gcov
+        libs = "-lgcov"
+        ldflags = "--coverage -lgcov"
+        config_args.append(f'LDFLAGS="{ldflags}"')
 
     # Inject CFLAGS into the command
-    full_cmd = f'CFLAGS="{cflags}" CXXFLAGS="{cflags}" {" ".join(config_args)}'
+    full_cmd = f'CFLAGS="{cflags}" CXXFLAGS="{cflags}" LIBS="{libs}" {" ".join(config_args)}'
     
     return run_command(full_cmd, cwd)
 
@@ -179,7 +222,7 @@ def get_imagemagick_tests(cwd):
         try:
             for f in sorted(os.listdir(tests_dir)):
                 if f.endswith(".tap"):
-                    t_name = f
+                    t_name = f[:-4] # Remove .tap extension for cleaner name
                     # We use 'make check' allowing us to run specific tests via TESTS variable
                     # Path must be relative to the root Makefile
                     test_path = os.path.join("tests", f)
@@ -206,11 +249,9 @@ def process_commit(commit: str, coverage: bool = True) -> (dict | None):
     
     commit_results = { "hash": commit, "tests": [] }
 
-    # [UPDATED CALLS]
     if not configure_imagemagick(PROJECT_DIR, coverage=coverage): return None
     if not build_imagemagick(PROJECT_DIR): return None
     
-    # [UPDATED CALL]
     suite = get_imagemagick_tests(PROJECT_DIR)
     print(f"\nRunning {len(suite)} tests...")
 
@@ -237,13 +278,43 @@ def process_commit(commit: str, coverage: bool = True) -> (dict | None):
         
         covered = get_covered_files(PROJECT_DIR)
         test['covered_files'] = covered
+
+        if not covered:
+             logging.warning(f"Test '{test.get('name')}' generated no coverage data.")
+             test['failed'] = True
+
+        # [NEW] GCOV Collection Logic
+        test_safe_name = t['name'].replace(" ", "_").replace("/", "_")
+        test_gcov_dir = os.path.join(GCDA_DIR, commit[:8], test_safe_name)
+        os.makedirs(test_gcov_dir, exist_ok=True)
+
+        gcda_files_list = get_gcda_files(PROJECT_DIR)
+        
+        for gcda in gcda_files_list:
+            gcda_dir = os.path.dirname(gcda)
+            
+            # Pass relative path to gcov (e.g., MagickCore/blob.gcda)
+            rel_gcda = os.path.relpath(gcda, PROJECT_DIR)
+            
+            # Run gcov from PROJECT_DIR to fix relative path resolution
+            run_command(f"gcov -p {rel_gcda}", cwd=PROJECT_DIR, ignore_errors=True)
+            
+            # Move results
+            run_command(f"find . -maxdepth 1 -name '*.gcov' -exec mv {{}} {test_gcov_dir}/ \\;", cwd=PROJECT_DIR)
+
+        # Cleanup artifacts so next test starts fresh
+        run_command("find . -name '*.gcda' -delete", PROJECT_DIR)
+        run_command("find . -name '*.gcov' -delete", PROJECT_DIR)
+
         commit_results['tests'].append(test)
         
     return commit_results
 
 def prepare_for_energy_measurement():
     print("\nPreparing project for energy measurement...")
-    # [UPDATED CALLS]
+    # Clean previous build
+    run_command("make clean", PROJECT_DIR)
+    
     configure_imagemagick(PROJECT_DIR, coverage=False)
     build_imagemagick(PROJECT_DIR)
 
@@ -280,9 +351,9 @@ def run_phase_1_coverage(vuln, fix):
     rapl_pkg = detect_rapl()
     kept_tests = [t for t in coverage_results['fix_commit'].get('tests', []) if t.get('keep', True) and not t.get('failed', True)]
 
-    prepare_for_energy_measurement()
-    for test in kept_tests:
-        measure_test(rapl_pkg, test, fix)
+    # prepare_for_energy_measurement()
+    # for test in kept_tests:
+    #     measure_test(rapl_pkg, test, fix)
 
     # VULN COMMIT
     coverage_results['vuln_commit'] = process_commit(vuln)
@@ -294,9 +365,9 @@ def run_phase_1_coverage(vuln, fix):
     
     kept_tests = [t for t in coverage_results.get('vuln_commit', {}).get('tests', []) if t.get('keep', True) and not t.get('failed', True)]
     
-    prepare_for_energy_measurement()
-    for test in kept_tests:
-        measure_test(rapl_pkg, test, vuln)
+    # prepare_for_energy_measurement()
+    # for test in kept_tests:
+    #     measure_test(rapl_pkg, test, vuln)
 
     return coverage_results
     
@@ -392,12 +463,18 @@ def main():
 
     pairs = []
     try:
-        with open(INPUT_CSV, 'r') as f:
+        with open(INPUT_CSV, 'r', encoding='utf-8-sig') as f:
             reader = csv.DictReader(f)
             for row in reader:
-                if row.get('project') == REPO_NAME and 'vuln_commit' in row and 'fix_commit' in row:
-                    pairs.append((row['vuln_commit'], row['fix_commit']))
+                p_name = row.get('project', '').strip()
+                if p_name.lower() == REPO_NAME.lower():
+                    if row.get('vuln_commit') and row.get('fix_commit'):
+                        pairs.append((row['vuln_commit'], row['fix_commit']))
     except Exception as e: sys.exit(1)
+    
+    if not pairs:
+        print(f"[ERROR] No pairs found for {REPO_NAME}")
+        sys.exit(1)
 
     for i, (vuln, fix) in enumerate(pairs[:10]):
         print(f"\n[{i+1}/{len(pairs)}] Processing Pair: {vuln[:8]} -> {fix[:8]}")
