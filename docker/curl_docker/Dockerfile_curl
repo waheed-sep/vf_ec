@@ -2,16 +2,16 @@
 FROM ubuntu:20.04
 
 ENV DEBIAN_FRONTEND=noninteractive
-# [FIX] Set a fake USER variable for curl's Perl test scripts
+# Set a fake USER variable for curl's Perl test scripts
 ENV USER=root
 
 # Install VFEC Core + curl Specific Dependencies
-# [FIX] Added 'python-is-python3', 'perl', and 'm4' for older curl buildconf/test scripts
+# [FIX] Added 'libtool-bin' (Critical for buildconf)
 RUN apt-get update && apt-get install -y \
     build-essential rsync wget curl \
     python3 python3-dev python-is-python3 libdw-dev libunwind-dev \
     flex bison git pkg-config libelf-dev python3-pip \
-    autoconf automake libtool m4 perl \
+    autoconf automake libtool libtool-bin m4 perl \
     libssl-dev zlib1g-dev libssh2-1-dev libidn2-dev \
     libbrotli-dev libzstd-dev \
     && rm -rf /var/lib/apt/lists/* \
