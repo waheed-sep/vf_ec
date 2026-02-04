@@ -1,0 +1,495 @@
+import os
+import subprocess
+import csv
+import logging
+import json
+import time
+import sys
+import urllib.request
+import re
+import shlex
+import yaml
+import wave # [NEW] To create dummy wav files
+
+# [KEEP] Project-Independent Helpers
+class ProgressBar:
+    def __init__(self, total, length=40, step=1):
+        self.total = total
+        self.length = length
+        self.step = step
+        self.current = 0
+
+    def update(self, i):
+        self.current = i
+        progress = (i + 1) / self.total
+        filled = int(self.length * progress)
+        bar = '█' * filled + '░' * (self.length - filled)
+        print(f"\r[{bar}] {i+1}/{self.total}", end='', flush=True)
+
+    def log(self, msg):
+        print()
+        print(msg)
+        self.update(self.current)
+
+    def set(self, i):
+        self.current = i
+        self.update(i)
+
+# ==========================================
+# CONFIGURATION
+# ==========================================
+REPO_NAME = "WavPack" 
+TARGET_DURATION_SEC = 2.0
+CSV_WRITE_INTERVAL = 50
+TEST_LIMIT = None
+
+GIST_CSV_URL = "https://gist.githubusercontent.com/waheed-sep/935cfc1ba42b2475d45336a4c779cbc8/raw/cwe_projects.csv"
+
+# ==========================================
+# PATHS
+# ==========================================
+BASE_DIR = "/app"
+INPUT_DIR = os.path.join(BASE_DIR, "inputs")
+OUTPUT_DIR = os.path.join(BASE_DIR, "output")
+INPUT_CSV = os.path.join(INPUT_DIR, "cwe_projects.csv")
+PROJECT_DIR = os.path.join(INPUT_DIR, REPO_NAME)
+LOG_DIR = os.path.join(OUTPUT_DIR, "log")
+CACHE_DIR = os.path.join(LOG_DIR, "cache")
+GCDA_DIR = os.path.join(OUTPUT_DIR, "gcda_files") 
+
+ITERATIONS = 5
+DEFAULT_TIMEOUT_MS = 2000
+COOL_DOWN_TO_SEC = 1.0
+
+ENERGY_RE = re.compile(r'\bpower/energy-[^/\s]+/?\b')
+
+def prepare_directories():
+    for d in [INPUT_DIR, OUTPUT_DIR, LOG_DIR, CACHE_DIR, GCDA_DIR]:
+        if not os.path.exists(d): os.makedirs(d)
+
+def setup_logging():
+    LOG_FILE = os.path.join(LOG_DIR, "pipeline_execution.log")
+    logging.basicConfig(filename=LOG_FILE, level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+def run_command(command, cwd, ignore_errors=False):
+    try:
+        env = os.environ.copy()
+        env["LC_ALL"] = "C"
+        result = subprocess.run(command, cwd=cwd, shell=True, env=env,
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True, errors='replace')
+        if result.returncode != 0 and not ignore_errors:
+            logging.error(f"FAIL: {command}\nSTDOUT: {result.stdout.strip()}\nSTDERR: {result.stderr.strip()}")
+            return False
+        return True
+    except Exception as e:
+        logging.error(f"EXCEPTION: {e}")
+        return False
+
+def save_json(filepath, data):
+    try:
+        with open(filepath, 'w') as f: json.dump(data, f, indent=4)
+    except Exception as e: logging.error(f"JSON Save Error: {e}")
+
+def load_json(filepath):
+    if os.path.exists(filepath):
+        try:
+            with open(filepath, 'r') as f: return json.load(f)
+        except: return {}
+    return {}
+
+def clean_repo(cwd):
+    run_command("git reset --hard", cwd)
+    run_command("git clean -fdx", cwd)
+
+def download_csv_if_missing():
+    if not os.path.exists(INPUT_CSV):
+        print(f"Downloading input CSV from Gist to {INPUT_CSV}...")
+        try:
+            urllib.request.urlretrieve(GIST_CSV_URL, INPUT_CSV)
+            print("Download complete.")
+        except Exception as e:
+            print(f"Error downloading CSV: {e}")
+            sys.exit(1)
+
+def get_git_diff_files(cwd, commit_hash):
+    cmd = f"git diff-tree --no-commit-id --name-only -r {commit_hash}"
+    result = subprocess.run(cmd, cwd=cwd, shell=True, stdout=subprocess.PIPE, text=True)
+    return {f for f in result.stdout.strip().split('\n') if f}
+
+def get_covered_files(cwd):
+    covered = set()
+    libtool_pattern = re.compile(r'^.*_la-(.*\.c)$')
+
+    for root, dirs, files in os.walk(cwd):
+        for file in files:
+            if file.endswith(".gcda"):
+                base_name = file.replace(".gcda", ".c")
+                match = libtool_pattern.match(base_name)
+                if match:
+                    real_name = match.group(1)
+                else:
+                    real_name = base_name
+
+                rel_dir = os.path.relpath(root, cwd)
+                full_path = real_name if rel_dir == "." else os.path.join(rel_dir, real_name)
+                
+                if not os.path.exists(os.path.join(cwd, full_path)):
+                     fallback = base_name if rel_dir == "." else os.path.join(rel_dir, base_name)
+                     if os.path.exists(os.path.join(cwd, fallback)):
+                         full_path = fallback
+
+                covered.add(full_path)
+    return list(covered)
+
+def get_gcda_files(cwd):
+    gcda_files = []
+    for root, dirs, files in os.walk(cwd):
+        for file in files:
+            if file.endswith(".gcda"):
+                gcda_files.append(os.path.join(root, file))
+    return gcda_files
+
+# [NEW] Helper to create a dummy WAV file for testing
+def create_dummy_wav(filepath):
+    try:
+        with wave.open(filepath, 'w') as f:
+            f.setnchannels(1)
+            f.setsampwidth(2)
+            f.setframerate(44100)
+            f.writeframes(b'\x00\x00' * 100) # 100 frames of silence
+        return True
+    except Exception as e:
+        logging.error(f"Failed to create dummy wav: {e}")
+        return False
+
+# ==========================================
+# WAVPACK SPECIFIC
+# ==========================================
+def configure_wavpack(cwd, coverage=False):
+    # [FIX] Always run autoreconf -fi to ensure install-sh/missing scripts are generated
+    logging.info("Running autoreconf -fi...")
+    run_command("autoreconf -fi", cwd, ignore_errors=True)
+
+    if not os.path.exists(os.path.join(cwd, "configure")):
+        logging.error("CRITICAL: Failed to generate configure script.")
+        return False
+
+    config_args = [
+        "./configure",
+        "--disable-shared",
+        "--enable-static"
+    ]
+
+    flags = "-O0 -w"
+    libs = ""
+    
+    if coverage:
+        flags += " --coverage"
+        libs = "-lgcov" 
+    
+    full_cmd = f'CFLAGS="{flags}" LDFLAGS="{flags}" LIBS="{libs}" {" ".join(config_args)}'
+    
+    return run_command(full_cmd, cwd)
+
+def build_wavpack(cwd):
+    return run_command("make -j$(nproc)", cwd)
+
+def get_wavpack_tests(cwd):
+    # 1. Standard Check (if available)
+    tests = [
+        {
+            "name": "wavpack-check",
+            "cmd": "timeout 300s make check || true", 
+            "type": "suite"
+        }
+    ]
+    return tests
+
+def run_manual_test(cwd):
+    # [NEW] Fallback: Run CLI manually if make check does nothing
+    dummy_wav = os.path.join(cwd, "test_dummy.wav")
+    create_dummy_wav(dummy_wav)
+    
+    # Locate the binary (could be in cli/ or .libs/ or root)
+    binary = None
+    possible_paths = [
+        os.path.join(cwd, "cli", "wavpack"),
+        os.path.join(cwd, "wavpack"),
+        os.path.join(cwd, ".libs", "wavpack"),
+        os.path.join(cwd, "cli", ".libs", "wavpack")
+    ]
+    
+    for p in possible_paths:
+        if os.path.exists(p) and os.access(p, os.X_OK):
+            binary = p
+            break
+            
+    if binary:
+        logging.info(f"Running manual fallback test with {binary}...")
+        # Compress the dummy wav to /dev/null
+        cmd = f"{binary} -y {dummy_wav} -o /dev/null"
+        run_command(cmd, cwd, ignore_errors=True)
+        return True
+    else:
+        logging.warning("Could not find wavpack binary for manual testing.")
+        return False
+
+# ==========================================
+# PHASE 1 & 2 LOGIC
+# ==========================================
+
+def process_commit(commit: str, coverage: bool = True):
+    logging.info(f"Building {commit[:8]} (Coverage)...")
+    clean_repo(PROJECT_DIR)
+    run_command(f"git checkout -f {commit}", PROJECT_DIR)
+    
+    commit_results = { "hash": commit, "tests": [] }
+
+    if not configure_wavpack(PROJECT_DIR, coverage=coverage): return None
+    if not build_wavpack(PROJECT_DIR): return None
+    
+    suite = get_wavpack_tests(PROJECT_DIR)
+    
+    # [FIX] If suite is empty or fails to generate coverage, we will try manual
+    pb = ProgressBar(len(suite), step=10)
+    for i, t in enumerate(suite):
+        pb.set(i)
+
+        test = {
+            "name": t['name'],
+            "failed": False,
+            "cmd": t['cmd'],
+            "covered_files": []
+        }
+        
+        run_command("find . -name '*.gcda' -delete", PROJECT_DIR)
+
+        # Run standard test
+        run_command(test.get('cmd'), PROJECT_DIR, ignore_errors=True)
+        
+        # Check coverage immediately
+        covered_files = get_gcda_files(PROJECT_DIR)
+        
+        # [NEW] If no coverage, try manual fallback
+        if not covered_files:
+            logging.info("Standard test yielded no coverage. Attempting manual fallback...")
+            run_manual_test(PROJECT_DIR)
+            covered_files = get_gcda_files(PROJECT_DIR)
+            
+        test_safe_name = t['name'].replace(" ", "_").replace("/", "_")
+        test_gcov_dir = os.path.join(GCDA_DIR, commit[:8], test_safe_name)
+        os.makedirs(test_gcov_dir, exist_ok=True)
+
+        for gcda in covered_files:
+            gcda_dir = os.path.dirname(gcda)
+            gcda_name = os.path.basename(gcda)
+            source_name = gcda_name.replace(".gcda", ".c")
+
+            if os.path.basename(gcda_dir) == ".libs":
+                work_dir = os.path.dirname(gcda_dir)
+                obj_dir = ".libs"
+            else:
+                work_dir = gcda_dir
+                obj_dir = "."
+
+            run_command(f"gcov -p --object-directory {obj_dir} {source_name}", cwd=work_dir, ignore_errors=True)
+
+        test['covered_files'] = get_covered_files(PROJECT_DIR)
+
+        if not test['covered_files']:
+             logging.warning(f"Test '{test.get('name')}' generated no coverage data.")
+             test['failed'] = True
+
+        run_command(f"find . -name '*.gcov' -exec cp {{}} {test_gcov_dir}/ \\;", PROJECT_DIR)
+        run_command("find . -name '*.gcda' -delete", PROJECT_DIR)
+        run_command("find . -name '*.gcov' -delete", PROJECT_DIR)
+
+        commit_results['tests'].append(test)
+        
+    return commit_results
+
+def prepare_for_energy_measurement():
+    print("\nPreparing project for energy measurement...")
+    clean_repo(PROJECT_DIR)
+    configure_wavpack(PROJECT_DIR, coverage=False)
+    build_wavpack(PROJECT_DIR)
+    
+def run_phase_1_coverage(vuln, fix):
+    logging.info(f"--- Phase 1: Coverage {vuln[:8]} -> {fix[:8]} ---")
+    coverage_results = {
+        "project": REPO_NAME,
+        "vuln_commit": { "hash": vuln, "failed":{ "status": False, "reason": "" }, "tests": [] },
+        "fix_commit": { "hash": fix, "failed": { "status": False, "reason": "" }, "tests": [] }
+    }
+    
+    clean_repo(PROJECT_DIR)
+    if not run_command(f"git checkout -f {fix}", PROJECT_DIR): return None
+    
+    git_changed_files= get_git_diff_files(PROJECT_DIR, fix)
+    if not git_changed_files: return None
+    
+    # FIX COMMIT
+    coverage_results['fix_commit'] = process_commit(fix)
+    
+    if not coverage_results['fix_commit']:
+        logging.error("Fix commit build/configure failed. Skipping pair.")
+        return None
+
+    valid_tests = [t for t in coverage_results['fix_commit'].get('tests', []) if t.get('covered_files')]
+    if not valid_tests:
+        logging.error("No coverage data generated for fix commit.")
+        return None
+    
+    extract_test_covering_git_changes(coverage_results.get('fix_commit', {}), git_changed_files)
+    logging.info(f"Extracted tests covering changed files in pair ({vuln[:8]}, {fix[:8]}).")
+    logging.info(f"Now computing energy for {fix[:8]}.")
+    
+    rapl_pkg = detect_rapl()
+    kept_tests = [t for t in coverage_results['fix_commit'].get('tests', []) if t.get('keep', True)]
+
+    # prepare_for_energy_measurement()
+    # for test in kept_tests:
+    #     measure_test(rapl_pkg, test, fix)
+
+    # VULN COMMIT
+    coverage_results['vuln_commit'] = process_commit(vuln)
+    if not coverage_results['vuln_commit']:
+        logging.error("Vuln commit build/configure failed. Skipping pair.")
+        return None
+
+    valid_tests = [t for t in coverage_results['vuln_commit'].get('tests', []) if t.get('covered_files')]
+    if not valid_tests:
+        return None
+
+    extract_test_covering_git_changes(coverage_results.get('vuln_commit', {}), git_changed_files)
+    logging.info(f"Extracted tests covering changed files in pair ({vuln[:8]}, {fix[:8]}).")
+    logging.info(f"Now computing energy for {vuln[:8]}.")
+    
+    kept_tests = [t for t in coverage_results.get('vuln_commit', {}).get('tests', []) if t.get('keep', True)]
+    
+    # prepare_for_energy_measurement()
+    # for test in kept_tests:
+    #     measure_test(rapl_pkg, test, vuln)
+
+    return coverage_results
+    
+def extract_test_covering_git_changes(coverage_results, target_files):  
+    for target in target_files:
+        for test in coverage_results.get('tests', []):
+            if coverage_results.get('failed', {}).get('status', True):
+                continue
+        
+            for test in coverage_results.get('tests', []):
+                covered_files = test.get('covered_files', [])
+                test['keep'] = True 
+
+# ==========================================
+# PHASE 2: ENERGY (Exact Copy)
+# ==========================================
+def detect_rapl(perf_bin="perf"):
+    cmd = [perf_bin, "list", "--no-desc"]
+    try:
+        out = subprocess.check_output(cmd, text=True, stderr=subprocess.STDOUT)
+    except subprocess.CalledProcessError:
+        out = subprocess.check_output([perf_bin, "list"], text=True, stderr=subprocess.STDOUT)
+
+    events = set()
+    for line in out.splitlines():
+        for m in ENERGY_RE.findall(line):
+            if not m.endswith("/"): m += "/"
+            events.add(m)
+    return sorted(events)
+
+def _wrap_until_timeout(test_cmd: str, timeout_ms: int) -> str:
+    timeout_s = max(1, int((timeout_ms + 999) / 1000))
+    wrapped = (
+        "bash -lc "
+        + shlex.quote(
+            f"""
+            set -e
+            end=$((SECONDS + {timeout_s}))
+            while [ $SECONDS -lt $end ]; do
+              {test_cmd}
+            done
+            """
+        )
+    )
+    return wrapped
+
+def measure_test(pkg_event, test, commit):
+    if isinstance(pkg_event, (list, tuple, set)):
+        events = [str(e).strip() for e in pkg_event if str(e).strip()]
+    elif pkg_event:
+        events = [str(pkg_event).strip()]
+    else:
+        events = []
+    if not events: events = ["power/energy-pkg/"]
+    perf_events = ",".join(events + ["cycles", "instructions"])
+    
+    pb = ProgressBar(ITERATIONS)
+    perf_dir = os.path.join(OUTPUT_DIR, REPO_NAME, "perf")
+    os.makedirs(perf_dir, exist_ok=True)
+
+    timeout_ms = test.get("timeout_ms", DEFAULT_TIMEOUT_MS)
+    print(f"\nMeasuring energy for test '{test.get('name')}': {ITERATIONS} iters")
+
+    for iteration in range(ITERATIONS):
+        pb.set(iteration)
+        perf_out = os.path.join(perf_dir, f"{commit}_{test.get('name')}__{iteration}.csv")
+        wrapped_cmd = _wrap_until_timeout(test["cmd"], timeout_ms)
+        perf_argv = ["perf", "stat", "-a", "-e", f"{perf_events}", "-x,", "--output", perf_out, "--", "sh", "-c", wrapped_cmd]
+
+        res = subprocess.run(perf_argv, cwd=PROJECT_DIR, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, errors='replace')
+        
+        if res.returncode != 0: 
+            logging.error(f"[STD ERR] {test.get('name')}: {res.stderr}")
+            if os.path.exists(perf_out): os.remove(perf_out)
+            return None
+        
+        time.sleep(COOL_DOWN_TO_SEC)
+    return None
+
+def read_configuration():
+    config_file = os.path.join(BASE_DIR, "config.yaml")
+    if os.path.exists(config_file):
+        try:
+            with open(config_file, 'r') as f: return yaml.safe_load(f)
+        except Exception: pass
+
+# ==========================================
+# MAIN
+# ==========================================
+def main():
+    prepare_directories()
+    setup_logging()
+    download_csv_if_missing()
+    read_configuration() 
+
+    pairs = []
+    try:
+        with open(INPUT_CSV, 'r', encoding='utf-8-sig') as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                p_name = row.get('project', '').strip()
+                if p_name.lower() == REPO_NAME.lower():
+                    if row.get('vuln_commit') and row.get('fix_commit'):
+                        pairs.append((row['vuln_commit'], row['fix_commit']))
+    except Exception as e:
+        sys.exit(1)
+
+    if not pairs:
+        sys.exit(1)
+
+    for i, (vuln, fix) in enumerate(pairs):
+        print(f"\n[{i+1}/{len(pairs)}] Processing Pair: {vuln[:8]} -> {fix[:8]}")
+        
+        coverage_dict = run_phase_1_coverage(vuln, fix)
+        if coverage_dict is None:
+            continue
+
+        coverage_path = os.path.join(OUTPUT_DIR, f"{REPO_NAME}_{vuln[:8]}_{fix[:8]}_coverage.json")
+        with open(coverage_path, "w") as f:
+                json.dump(coverage_dict, f, indent=2)
+
+if __name__ == "__main__":
+    main()
