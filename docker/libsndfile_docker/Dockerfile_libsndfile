@@ -1,0 +1,32 @@
+# Using Ubuntu 20.04 for compatibility with older Autotools scripts
+FROM ubuntu:20.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV USER=root
+
+# Install VFEC Core + libsndfile Dependencies
+# [FIX] Added 'autogen' (Required by some older libsndfile versions to generate tests)
+RUN apt-get update && apt-get install -y --fix-missing \
+    build-essential rsync wget curl \
+    python3 python3-dev python-is-python3 libdw-dev libunwind-dev \
+    flex bison git pkg-config libelf-dev python3-pip \
+    autoconf automake libtool libtool-bin autogen \
+    libflac-dev libogg-dev libvorbis-dev libsqlite3-dev \
+    && rm -rf /var/lib/apt/lists/* \
+    && git clone --depth 1 https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git \
+    && cd linux/tools/perf \
+    && NO_JEVENTS=1 NO_LIBTRACEEVENT=1 make \
+    && cp perf /usr/bin \
+    && cd / && rm -rf linux
+
+COPY requirements.txt /app/
+RUN pip3 install --no-cache-dir -r /app/requirements.txt
+
+WORKDIR /app
+
+# Download libsndfile Repo
+RUN git clone https://github.com/libsndfile/libsndfile.git /app/inputs/libsndfile
+
+COPY libsndfile_pipeline.py /app/
+
+CMD ["python3", "libsndfile_pipeline.py"]
