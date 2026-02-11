@@ -13,6 +13,11 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 INPUT_FILE = os.path.join(BASE_DIR, "final_results", f"{PROJECT_NAME}_final", f"{PROJECT_NAME}_final_pertest.csv")
 OUTPUT_DIR = os.path.join(BASE_DIR, "final_results", f"{PROJECT_NAME}_final")
 
+# THRESHOLD: Group CWEs with fewer than this many commits into "Other"
+# The PDF suggests 10-20. Since your dataset might be smaller, I set it to 3 for now.
+# You can change this to 5 or 10.
+MIN_COMMITS_THRESHOLD = 3 
+
 # Output Files
 DETAILED_OUTPUT = os.path.join(OUTPUT_DIR, f"{PROJECT_NAME}_detailed_stats.csv")
 SUMMARY_OUTPUT = os.path.join(OUTPUT_DIR, f"{PROJECT_NAME}_cwe_summary.csv")
@@ -20,160 +25,114 @@ HEATMAP_FULL = os.path.join(OUTPUT_DIR, f"{PROJECT_NAME}_heatmap_full.png")
 HEATMAP_RISK = os.path.join(OUTPUT_DIR, f"{PROJECT_NAME}_heatmap_risk_only.png")
 
 def calculate_hedges_g(v_data, f_data):
-    """
-    Calculates Hedges' g effect size with small sample correction (J).
-    """
-    n1 = len(v_data)
-    n2 = len(f_data)
+    """Calculates Hedges' g effect size with small sample correction (J)."""
+    n1, n2 = len(v_data), len(f_data)
+    m1, m2 = np.mean(v_data), np.mean(f_data)
+    s1, s2 = np.std(v_data, ddof=1), np.std(f_data, ddof=1)
     
-    # Means
-    m1 = np.mean(v_data)
-    m2 = np.mean(f_data)
-    
-    # Standard Deviations (ddof=1 for Sample SD)
-    s1 = np.std(v_data, ddof=1)
-    s2 = np.std(f_data, ddof=1)
-    
-    # Pooled Standard Deviation Formula
     numerator = ((n1 - 1) * (s1 ** 2)) + ((n2 - 1) * (s2 ** 2))
     denominator = n1 + n2 - 2
     s_pooled = np.sqrt(numerator / denominator)
     
-    # Small Sample Correction Factor (J)
-    df = denominator
-    J = 1 - (3 / (4 * df - 1))
+    J = 1 - (3 / (4 * denominator - 1))
     
-    # Hedges' g
-    if s_pooled == 0:
-        return 0.0
-    g = ((m2 - m1) / s_pooled) * J
-    return g
+    if s_pooled == 0: return 0.0
+    return ((m2 - m1) / s_pooled) * J
 
 def analyze_test_group(group):
-    """
-    Performs the Stats Analysis for one specific Test Case (contains 5 iterations).
-    """
-    # Extract the 5 runs for Vuln and Fix
+    """Performs Stats Analysis (Mann-Whitney + Hedges g) for one test case."""
     v_data = group['vuln_energy_pkg'].astype(float).values
     f_data = group['fix_energy_pkg'].astype(float).values
     
-    # 1. Descriptive Stats
-    mean_v = np.mean(v_data)
-    mean_f = np.mean(f_data)
-    median_v = np.median(v_data)
-    median_f = np.median(f_data)
-    
-    # 2. Mann-Whitney U Test
     try:
         stat, p_value = mannwhitneyu(f_data, v_data, alternative='two-sided')
     except ValueError:
         p_value = 1.0 
 
-    # 3. Effect Size
     hedges_g = calculate_hedges_g(v_data, f_data)
-    
-    # 4. Classification
     is_significant = p_value < 0.05
     
-    if not is_significant:
-        result_class = "Neutral"
-    elif hedges_g > 0:
-        result_class = "Increase" 
-    else:
-        result_class = "Decrease" 
+    if not is_significant: result_class = "Neutral"
+    elif hedges_g > 0: result_class = "Increase" 
+    else: result_class = "Decrease" 
 
     return pd.Series({
-        'mean_vuln': mean_v,
-        'mean_fix': mean_f,
-        'median_vuln': median_v,
-        'median_fix': median_f,
         'p_value': p_value,
         'hedges_g': hedges_g,
         'result_class': result_class
     })
 
 def generate_heatmaps(summary_df):
-    """Generates and saves the heatmap visualizations."""
+    """Generates heatmaps from the summary dataframe."""
     print("\n[*] Generating Heatmaps...")
-    
-    # Ensure necessary columns exist (fill with 0 if missing)
     required_cols = ['%_Increase', '%_Decrease', '%_Neutral']
     for col in required_cols:
-        if col not in summary_df.columns:
-            summary_df[col] = 0.0
+        if col not in summary_df.columns: summary_df[col] = 0.0
 
-    # 1. FULL HEATMAP (Neutral Included)
+    # 1. Full Heatmap
     plt.figure(figsize=(10, 6))
-    data_full = summary_df[required_cols]
-    sns.heatmap(data_full, annot=True, fmt=".1f", cmap="Blues", linewidths=.5)
-    plt.title(f"RQ4: Energy Impact by CWE Type ({PROJECT_NAME})\n(Numbers represent % of tests)", fontsize=14)
-    plt.ylabel("Vulnerability Type (CWE)")
-    plt.xlabel("Energy Impact Category")
+    sns.heatmap(summary_df[required_cols], annot=True, fmt=".1f", cmap="Blues", linewidths=.5)
+    plt.title(f"RQ4: Energy Impact by CWE (Grouped < {MIN_COMMITS_THRESHOLD} commits)", fontsize=14)
     plt.tight_layout()
     plt.savefig(HEATMAP_FULL, dpi=300)
-    print(f"[+] Full Heatmap saved to: {HEATMAP_FULL}")
     plt.close()
 
-    # 2. RISK HEATMAP (Neutral Excluded)
-    plt.figure(figsize=(8, 6))
-    cols_risk = ['%_Increase', '%_Decrease']
-    data_risk = summary_df[cols_risk]
-    
-    # Only plot if we have data, otherwise it errors
-    if not data_risk.empty:
-        sns.heatmap(data_risk, annot=True, fmt=".1f", cmap="Reds", linewidths=.5)
-        plt.title(f"RQ4: Significant Energy Changes Only\n(Excluding Neutral Cases)", fontsize=14)
-        plt.ylabel("Vulnerability Type (CWE)")
-        plt.xlabel("Energy Impact")
+    # 2. Risk Heatmap
+    if not summary_df[['%_Increase', '%_Decrease']].empty:
+        plt.figure(figsize=(8, 6))
+        sns.heatmap(summary_df[['%_Increase', '%_Decrease']], annot=True, fmt=".1f", cmap="Reds", linewidths=.5)
+        plt.title("RQ4: Significant Energy Risks (Rare CWEs grouped)", fontsize=14)
         plt.tight_layout()
         plt.savefig(HEATMAP_RISK, dpi=300)
-        print(f"[+] Risk Heatmap saved to: {HEATMAP_RISK}")
-    plt.close()
+        plt.close()
 
 def main():
-    print(f"[*] Loading data from: {INPUT_FILE}")
     if not os.path.exists(INPUT_FILE):
-        print("[!] Input file not found.")
+        print(f"[!] Input file not found: {INPUT_FILE}")
         return
 
     df = pd.read_csv(INPUT_FILE)
-
-    # --- Step A: Data Transformation ---
-    # Strip iteration suffix to group test cases
     df['base_testname'] = df['vuln_testname'].apply(lambda x: x.rsplit('_', 1)[0])
 
-    print("[*] Grouping iterations (n=5) per test...")
+    print("[*] Running Statistical Analysis per Test...")
     grouped = df.groupby(['vuln_commit', 'fix_commit', 'base_testname', 'cwe'])
     stats_df = grouped.apply(analyze_test_group).reset_index()
-
-    # Save Detailed Results
     stats_df.to_csv(DETAILED_OUTPUT, index=False)
-    print(f"[+] Detailed statistics saved to: {DETAILED_OUTPUT}")
 
-    # --- Step B: CWE Summary & Visualization ---
-    print("\n[*] Generating CWE Summary (Sanity Check)...")
+    # --- NEW STEP: Group Rare CWEs ---
+    print(f"\n[*] Grouping CWEs with fewer than {MIN_COMMITS_THRESHOLD} commits into 'Other'...")
     
-    # Count occurrences per CWE
-    summary = stats_df.groupby(['cwe', 'result_class']).size().unstack(fill_value=0)
+    # 1. Count unique commits per CWE
+    # We use 'vuln_commit' as the identifier for the commit
+    cwe_counts = stats_df.groupby('cwe')['vuln_commit'].nunique()
+    
+    # 2. Identify rare CWEs
+    rare_cwes = cwe_counts[cwe_counts < MIN_COMMITS_THRESHOLD].index.tolist()
+    print(f"    -> Found {len(rare_cwes)} rare CWEs: {rare_cwes}")
+    
+    # 3. Replace rare CWE names with "Other" in a COPY of the dataframe
+    # We use a copy so we don't lose the original data in detailed_stats.csv
+    summary_df_input = stats_df.copy()
+    summary_df_input.loc[summary_df_input['cwe'].isin(rare_cwes), 'cwe'] = 'Other'
+
+    # --- Generate Summary ---
+    summary = summary_df_input.groupby(['cwe', 'result_class']).size().unstack(fill_value=0)
     summary['Total_Tests'] = summary.sum(axis=1)
     
-    # Calculate Percentages
-    cols = [c for c in ['Increase', 'Decrease', 'Neutral'] if c in summary.columns]
-    for col in cols:
-        summary[f'%_{col}'] = (summary[col] / summary['Total_Tests'] * 100).round(1)
+    for col in ['Increase', 'Decrease', 'Neutral']:
+        if col in summary.columns:
+            summary[f'%_{col}'] = (summary[col] / summary['Total_Tests'] * 100).round(1)
+        else:
+            summary[f'%_{col}'] = 0.0
 
-    # Display in Terminal
     print("\n" + "="*60)
-    print("CWE ENERGY IMPACT SUMMARY (RQ4)")
+    print("CWE ENERGY IMPACT SUMMARY (RQ4) - GROUPED")
     print("="*60)
-    display_cols = ['Total_Tests'] + [c for c in summary.columns if '%' in c]
-    print(summary[display_cols])
+    print(summary[['Total_Tests', '%_Increase', '%_Decrease', '%_Neutral']])
     
     summary.to_csv(SUMMARY_OUTPUT)
-    print(f"\n[+] Summary saved to: {SUMMARY_OUTPUT}")
-
-    # --- Step C: Generate Heatmaps ---
     generate_heatmaps(summary)
+    print(f"\n[+] Processing Complete. Heatmaps saved in {OUTPUT_DIR}")
 
 if __name__ == "__main__":
     main()
