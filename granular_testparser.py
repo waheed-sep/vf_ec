@@ -38,6 +38,7 @@ COMMIT_OUTPUT = os.path.join(OUTPUT_DIR, f"{PROJECT_NAME}_commit_stats.csv")
 REGRESSION_OUTPUT = os.path.join(OUTPUT_DIR, f"{PROJECT_NAME}_cwe_regression_results.csv")
 HEATMAP_FILE = os.path.join(OUTPUT_DIR, f"{PROJECT_NAME}_commit_heatmap.png")
 BETA_PLOT_FILE = os.path.join(OUTPUT_DIR, f"{PROJECT_NAME}_regression_betas.png")
+RQ1_PLOT_FILE = os.path.join(OUTPUT_DIR, f"{PROJECT_NAME}_rq1_global_impact.png") # NEW FILE
 
 # ==========================================
 # HELPERS
@@ -65,18 +66,19 @@ def calculate_hedges_g_and_se(v_data, f_data):
     return g, se_g
 
 def analyze_test_raw(group):
-    v_data = pd.to_numeric(group['vuln_energy_pkg'], errors='coerce').dropna().values
-    f_data = pd.to_numeric(group['fix_energy_pkg'], errors='coerce').dropna().values
+    # Ensure numeric conversion happens safely
+    v_vals = pd.to_numeric(group['vuln_energy_pkg'], errors='coerce').dropna().values
+    f_vals = pd.to_numeric(group['fix_energy_pkg'], errors='coerce').dropna().values
     
-    if len(v_data) < 3 or len(f_data) < 3:
+    if len(v_vals) < 3 or len(f_vals) < 3:
         return pd.Series({'raw_p_value': 1.0, 'hedges_g': 0.0, 'se_g': 0.0})
 
     try:
-        stat, p_value = mannwhitneyu(f_data, v_data, alternative='two-sided')
+        stat, p_value = mannwhitneyu(f_vals, v_vals, alternative='two-sided')
     except ValueError:
         p_value = 1.0 
 
-    g, se_g = calculate_hedges_g_and_se(v_data, f_data)
+    g, se_g = calculate_hedges_g_and_se(v_vals, f_vals)
     return pd.Series({'raw_p_value': p_value, 'hedges_g': g, 'se_g': se_g})
 
 def aggregate_commit(group):
@@ -84,19 +86,19 @@ def aggregate_commit(group):
     g_values = group['hedges_g'].values
     se_values = group['se_g'].values
     
-    # Filter valid SE
+    # Filter valid SE (avoid division by zero)
     valid_indices = se_values > 1e-9
+    
     if not np.any(valid_indices):
         return pd.Series({'g_commit': 0.0, 'se_commit': 0.0, 'ci_lower': 0.0, 'ci_upper': 0.0})
         
     g_valid = g_values[valid_indices]
     se_valid = se_values[valid_indices]
     
-    # Inverse-Variance Weighting
-    # Used Meta-Analysis / Weighted Regression instead of FDR correction. 
-    # This is more powerful than FDR for combining effect sizes, especially when we have varying precision (SE) across tests.
+    # Inverse-Variance Weighting (Meta-Analysis Approach)
     weights = 1.0 / (se_valid ** 2)
     sum_w = np.sum(weights)
+    
     g_commit = np.sum(weights * g_valid) / sum_w
     se_commit = np.sqrt(1.0 / sum_w)
     
@@ -120,6 +122,7 @@ def generate_commit_heatmap(commit_df):
     print("    [+] Generating Commit-Level Heatmap...")
     
     # Group by CWE and Result Class
+    # Ensure we count properly
     summary = commit_df.groupby(['cwe', 'result_class']).size().unstack(fill_value=0)
     
     # Ensure columns exist
@@ -144,20 +147,16 @@ def generate_commit_heatmap(commit_df):
     plt.close()
 
 def generate_beta_plot(results_df):
-    """Generates a Forest Plot of Regression Betas (Energy Impact)."""
-    print("    [+] Generating Regression Beta Plot (Forest Plot)...")
+    """Generates a Forest Plot of Regression Betas (RQ3)."""
+    print("    [+] Generating Regression Beta Plot (RQ3)...")
     
     # Sort by coefficient value for cleaner plot
     results_df = results_df.sort_values(by='coef', ascending=True)
-    
-    # Clean CWE names (remove 'cwe_' prefix from dummy variables if present)
-    # Statsmodels often names columns like "cwe[T.CWE-122]"
     results_df['label'] = results_df.index
     
     plt.figure(figsize=(10, 6))
     
-    # Plot Points (Coefficients) and Error Bars (Confidence Intervals)
-    # Error bars: needs shape (2, N) -> [[lower_errors], [upper_errors]]
+    # Error bars format: [[lower_errors], [upper_errors]]
     y_err = [
         results_df['coef'] - results_df['ci_lower'], 
         results_df['ci_upper'] - results_df['coef']
@@ -166,15 +165,50 @@ def generate_beta_plot(results_df):
     plt.errorbar(x=results_df['coef'], y=results_df['label'], xerr=y_err, 
                  fmt='o', color='black', ecolor='red', capsize=5, label='Beta (Impact)')
     
-    # Add Reference Line at 0 (Neutral)
     plt.axvline(x=0, color='blue', linestyle='--', linewidth=1, label='Neutral (0)')
     
-    plt.title("Regression Analysis: Energy Impact per CWE (Beta Coefficients)")
+    plt.title("RQ3: Regression Analysis (Energy Impact per CWE)")
     plt.xlabel("Energy Impact (Hedges' g)\nPositive = Increases Energy | Negative = Saves Energy")
     plt.ylabel("Vulnerability Type")
     plt.grid(axis='x', linestyle='--', alpha=0.7)
     plt.tight_layout()
     plt.savefig(BETA_PLOT_FILE, dpi=300)
+    plt.close()
+
+def generate_rq1_plot(g_global, ci_lower, ci_upper):
+    """Generates a Single Point Plot for RQ1 (Overall Impact)."""
+    print("    [+] Generating RQ1 Global Impact Plot...")
+    
+    plt.figure(figsize=(8, 3))
+    
+    # Calculate error lengths for matplotlib
+    x_err = [[g_global - ci_lower], [ci_upper - g_global]]
+    
+    # Plot the point
+    plt.errorbar(x=g_global, y=[0], xerr=x_err, 
+                 fmt='D', markersize=10, color='black', ecolor='red', 
+                 capsize=10, elinewidth=2, label='Global Weighted Mean')
+    
+    # Add Neutral Line
+    plt.axvline(x=0, color='blue', linestyle='--', linewidth=1.5, label='Neutral (0)')
+    
+    # Formatting
+    plt.yticks([]) # Hide Y-axis ticks
+    plt.ylabel("All Commits")
+    plt.xlabel("Global Hedges' g (Effect Size)\nPositive = Increases Energy | Negative = Saves Energy")
+    plt.title(f"RQ1: Overall Energy Impact of Vulnerability Fixes\n(g = {g_global:.3f}, 95% CI: [{ci_lower:.3f}, {ci_upper:.3f}])")
+    
+    # Add text annotation
+    verdict = "NEUTRAL" if (ci_lower <= 0 <= ci_upper) else ("INCREASE" if g_global > 0 else "DECREASE")
+    color = "green" if verdict == "NEUTRAL" else "red"
+    
+    plt.text(g_global, 0.1, f"Verdict: {verdict}", 
+             ha='center', va='bottom', fontsize=12, fontweight='bold', color=color)
+
+    plt.grid(axis='x', linestyle='--', alpha=0.5)
+    plt.ylim(-0.5, 0.5) # Center the dot vertically
+    plt.tight_layout()
+    plt.savefig(RQ1_PLOT_FILE, dpi=300)
     plt.close()
 
 # ==========================================
@@ -197,6 +231,7 @@ def main():
         return
     
     df = pd.read_csv(input_path)
+    # Extract base testname (remove suffixes if present)
     df['base_testname'] = df['vuln_testname'].astype(str).apply(lambda x: x.rsplit('_', 1)[0])
     df['cwe'] = df['cwe'].fillna('Unknown')
 
@@ -205,18 +240,18 @@ def main():
     # ---------------------------------------------------------
     print("[1/3] Running Per-Test Analysis...")
     cols_needed = ['vuln_energy_pkg', 'fix_energy_pkg']
+    
+    # Apply raw analysis
     grouped = df.groupby(['vuln_commit', 'fix_commit', 'base_testname', 'cwe'])[cols_needed]
     stats_df = grouped.apply(analyze_test_raw).reset_index()
     stats_df.to_csv(DETAILED_OUTPUT, index=False)
 
     # ---------------------------------------------------------
-    # STAGE 2: Per-Commit Aggregation (Option A)
+    # STAGE 2: Per-Commit Aggregation
     # ---------------------------------------------------------
     print("\n[2/3] Aggregating Results per Commit...")
     
     commit_grouped = stats_df.groupby(['vuln_commit', 'cwe'])
-    # Need to select columns to apply function cleanly
-    # cols_agg = ['hedges_g', 'se_g']
     commit_stats = commit_grouped.apply(aggregate_commit).reset_index()
     
     # Classify based on CI
@@ -227,29 +262,58 @@ def main():
 
     commit_stats['result_class'] = commit_stats.apply(classify_commit, axis=1)
     
-    # Group Rare CWEs for Visualization
-    cwe_counts = commit_stats['cwe'].value_counts()
-    rare_cwes = cwe_counts[cwe_counts < MIN_COMMITS_THRESHOLD].index
-    commit_stats.loc[commit_stats['cwe'].isin(rare_cwes), 'cwe'] = 'Other'
-    
+    # Save Full Commit Stats
     commit_stats.to_csv(COMMIT_OUTPUT, index=False)
     print(f"      -> Commit-level stats saved to: {COMMIT_OUTPUT}")
-    
-    # GENERATE HEATMAP
-    generate_commit_heatmap(commit_stats)
 
     # ---------------------------------------------------------
-    # STAGE 3: Weighted Regression
+    # STAGE 2.5: GLOBAL AGGREGATION (RQ1 ANSWER)
     # ---------------------------------------------------------
-    print("\n[3/3] Running CWE Regression Analysis...")
+    print("\n[2.5] Calculating Global Weighted Mean (RQ1)...")
     
-    # Filter out "Other" or keep them? PDF says group them. 
-    # We already grouped them in commit_stats above.
+    # Filter valid commits (avoid division by zero if se_commit is 0)
+    valid_commits = commit_stats[commit_stats['se_commit'] > 1e-9].copy()
     
-    # Prepare Regression Data
-    X = pd.get_dummies(commit_stats['cwe'], dtype=float)
-    y = commit_stats['g_commit']
-    se = commit_stats['se_commit'].replace(0, 1e-9)
+    if not valid_commits.empty:
+        # Inverse-Variance Weighting across ALL commits
+        weights = 1.0 / (valid_commits['se_commit'] ** 2)
+        sum_w = np.sum(weights)
+        
+        g_global = np.sum(weights * valid_commits['g_commit']) / sum_w
+        se_global = np.sqrt(1.0 / sum_w)
+        
+        ci_lower_global = g_global - (1.96 * se_global)
+        ci_upper_global = g_global + (1.96 * se_global)
+        
+        print(f"      -> Global g: {g_global:.4f}")
+        print(f"      -> 95% CI: [{ci_lower_global:.4f}, {ci_upper_global:.4f}]")
+        
+        # GENERATE RQ1 PLOT
+        generate_rq1_plot(g_global, ci_lower_global, ci_upper_global)
+    else:
+        print("      [!] No valid commits found for Global Aggregation.")
+
+    # ---------------------------------------------------------
+    # STAGE 3: Weighted Regression & Visualization
+    # ---------------------------------------------------------
+    print("\n[3/3] Running CWE Regression Analysis & Visualization...")
+    
+    # Prepare Data for Heatmap: Group Rare CWEs
+    cwe_counts = commit_stats['cwe'].value_counts()
+    rare_cwes = cwe_counts[cwe_counts < MIN_COMMITS_THRESHOLD].index
+    
+    # Create a copy for visualization so we don't mess up the raw data for regression
+    viz_df = commit_stats.copy()
+    viz_df.loc[viz_df['cwe'].isin(rare_cwes), 'cwe'] = 'Other'
+    
+    # GENERATE HEATMAP
+    generate_commit_heatmap(viz_df)
+
+    # Prepare Data for Regression: (Use viz_df to keep 'Other' grouping or commit_stats for full?)
+    # Usually better to use the grouped version to avoid noisy singletons
+    X = pd.get_dummies(viz_df['cwe'], dtype=float)
+    y = viz_df['g_commit']
+    se = viz_df['se_commit'].replace(0, 1e-9)
     weights = 1.0 / (se ** 2)
     
     try:
@@ -269,7 +333,7 @@ def main():
         })
         results_df.to_csv(REGRESSION_OUTPUT)
         
-        # GENERATE BETA PLOT
+        # GENERATE BETA PLOT (RQ3)
         generate_beta_plot(results_df)
         
     except Exception as e:
