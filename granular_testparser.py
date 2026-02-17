@@ -1,49 +1,33 @@
 import sys
 import os
+import glob
 import matplotlib
 matplotlib.use('Agg') 
 import matplotlib.pyplot as plt
-
-try:
-    import pandas as pd
-    import numpy as np
-    from scipy.stats import mannwhitneyu
-    import seaborn as sns
-    from statsmodels.stats.multitest import multipletests
-    import statsmodels.api as sm
-except ImportError as e:
-    print(f"[!] CRITICAL ERROR: Missing Library. {e}")
-    sys.exit(1)
+import pandas as pd
+import numpy as np
+import seaborn as sns
+import statsmodels.api as sm
 
 # ==========================================
 # CONFIGURATION
 # ==========================================
-PROJECT_NAME = "vim"
+# 1. SETUP INPUT: Search recursively in this directory
+SEARCH_ROOT_DIR = "final_results"
+FILE_PATTERN = "**/*_final_pertest.csv" # Finds any matching file in subfolders
+
+# 2. SETUP OUTPUT: Results will be saved here
+OUTPUT_DIR = "multi_project_results"
+
 MIN_COMMITS_THRESHOLD = 3 
 ALPHA_THRESHOLD = 0.05
 
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-POSSIBLE_PATHS = [
-    os.path.join(BASE_DIR, "final_results", f"{PROJECT_NAME}_final", f"{PROJECT_NAME}_final_pertest.csv"),
-    os.path.join(BASE_DIR, f"{PROJECT_NAME}_final_pertest.csv"),
-    os.path.join(os.getcwd(), f"{PROJECT_NAME}_final_pertest.csv")
-]
-
-OUTPUT_DIR = os.path.join(BASE_DIR, "final_results", f"{PROJECT_NAME}_final")
-if not os.path.exists(OUTPUT_DIR): os.makedirs(OUTPUT_DIR, exist_ok=True)
-
-# Output Files
-DETAILED_OUTPUT = os.path.join(OUTPUT_DIR, f"{PROJECT_NAME}_detailed_stats_fdr.csv")
-COMMIT_OUTPUT = os.path.join(OUTPUT_DIR, f"{PROJECT_NAME}_commit_stats.csv")
-REGRESSION_OUTPUT = os.path.join(OUTPUT_DIR, f"{PROJECT_NAME}_cwe_regression_results.csv")
-HEATMAP_FILE = os.path.join(OUTPUT_DIR, f"{PROJECT_NAME}_commit_heatmap.png")
-BETA_PLOT_FILE = os.path.join(OUTPUT_DIR, f"{PROJECT_NAME}_regression_betas.png")
-RQ1_PLOT_FILE = os.path.join(OUTPUT_DIR, f"{PROJECT_NAME}_rq1_global_impact.png") # NEW FILE
+if not os.path.exists(OUTPUT_DIR): 
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 # ==========================================
 # HELPERS
 # ==========================================
-
 def calculate_hedges_g_and_se(v_data, f_data):
     n1, n2 = len(v_data), len(f_data)
     if n1 < 2 or n2 < 2: return 0.0, 0.0
@@ -61,285 +45,280 @@ def calculate_hedges_g_and_se(v_data, f_data):
     if s_pooled == 0: return 0.0, 0.0
     g = ((m2 - m1) / s_pooled) * J
     
-    # Standard Error of Hedges' g
     se_g = np.sqrt(((n1 + n2) / (n1 * n2)) + (g ** 2) / (2 * (n1 + n2)))
     return g, se_g
 
 def analyze_test_raw(group):
-    # Ensure numeric conversion happens safely
     v_vals = pd.to_numeric(group['vuln_energy_pkg'], errors='coerce').dropna().values
     f_vals = pd.to_numeric(group['fix_energy_pkg'], errors='coerce').dropna().values
     
     if len(v_vals) < 3 or len(f_vals) < 3:
-        return pd.Series({'raw_p_value': 1.0, 'hedges_g': 0.0, 'se_g': 0.0})
-
-    try:
-        stat, p_value = mannwhitneyu(f_vals, v_vals, alternative='two-sided')
-    except ValueError:
-        p_value = 1.0 
+        return pd.Series({'hedges_g': 0.0, 'se_g': 0.0})
 
     g, se_g = calculate_hedges_g_and_se(v_vals, f_vals)
-    return pd.Series({'raw_p_value': p_value, 'hedges_g': g, 'se_g': se_g})
+    return pd.Series({'hedges_g': g, 'se_g': se_g})
 
 def aggregate_commit(group):
-    """Combines multiple tests in a commit into one score."""
     g_values = group['hedges_g'].values
     se_values = group['se_g'].values
-    
-    # Filter valid SE (avoid division by zero)
     valid_indices = se_values > 1e-9
     
     if not np.any(valid_indices):
-        return pd.Series({'g_commit': 0.0, 'se_commit': 0.0, 'ci_lower': 0.0, 'ci_upper': 0.0})
+        return pd.Series({'g_commit': 0.0, 'se_commit': 0.0})
         
     g_valid = g_values[valid_indices]
     se_valid = se_values[valid_indices]
     
-    # Inverse-Variance Weighting (Meta-Analysis Approach)
     weights = 1.0 / (se_valid ** 2)
     sum_w = np.sum(weights)
     
     g_commit = np.sum(weights * g_valid) / sum_w
     se_commit = np.sqrt(1.0 / sum_w)
     
-    # 95% CI
-    ci_lower = g_commit - (1.96 * se_commit)
-    ci_upper = g_commit + (1.96 * se_commit)
-    
-    return pd.Series({
-        'g_commit': g_commit,
-        'se_commit': se_commit,
-        'ci_lower': ci_lower,
-        'ci_upper': ci_upper
-    })
+    return pd.Series({'g_commit': g_commit, 'se_commit': se_commit})
 
 # ==========================================
-# VISUALIZATION FUNCTIONS
+# VISUALIZATION
 # ==========================================
+def generate_rq1_multi_plot(project_results):
+    print("    [+] Generating RQ1 Multi-Project Plot...")
+    
+    labels = [k for k in project_results.keys() if k != 'OVERALL']
+    labels.sort()
+    labels.append('OVERALL')
+        
+    g_vals = [project_results[l]['g'] for l in labels]
+    cis_low = [project_results[l]['ci_lower'] for l in labels]
+    cis_high = [project_results[l]['ci_upper'] for l in labels]
+    
+    plt.figure(figsize=(10, 3 + len(labels)*1))
+    
+    x_err_lower = [g - low for g, low in zip(g_vals, cis_low)]
+    x_err_upper = [high - g for high, g in zip(cis_high, g_vals)]
+    
+    y_pos = np.arange(len(labels))
+    
+    for i, label in enumerate(labels):
+        is_overall = (label == 'OVERALL')
+        color = 'black' if is_overall else 'gray'
+        marker = 'D' if is_overall else 'o'
+        size = 12 if is_overall else 8
+        lw = 2 if is_overall else 1.5
+        
+        plt.errorbar(x=g_vals[i], y=i, xerr=[[x_err_lower[i]], [x_err_upper[i]]], 
+                     fmt=marker, color=color, ecolor='red' if is_overall else 'blue', 
+                     capsize=5, markersize=size, elinewidth=lw)
+        
+        plt.text(g_vals[i], i + 0.1, f"{g_vals[i]:.3f}", ha='center', va='bottom', fontsize=9, fontweight='bold')
 
-def generate_commit_heatmap(commit_df):
-    """Generates a heatmap based on Commit-Level Classifications."""
-    print("    [+] Generating Commit-Level Heatmap...")
-    
-    # Group by CWE and Result Class
-    # Ensure we count properly
-    summary = commit_df.groupby(['cwe', 'result_class']).size().unstack(fill_value=0)
-    
-    # Ensure columns exist
-    for col in ['Increase', 'Decrease', 'Neutral']:
-        if col not in summary.columns: summary[col] = 0
-
-    summary['Total'] = summary.sum(axis=1)
-    
-    # Calculate Percentages
-    plot_data = summary.copy()
-    for col in ['Increase', 'Decrease', 'Neutral']:
-        plot_data[col] = (plot_data[col] / plot_data['Total'] * 100).round(1)
-    
-    # Plot
-    plt.figure(figsize=(10, 6))
-    sns.heatmap(plot_data[['Increase', 'Decrease', 'Neutral']], annot=True, fmt=".1f", cmap="Blues", linewidths=.5)
-    plt.title(f"RQ4: Energy Impact by CWE (Commit Level Aggregation)")
-    plt.ylabel("Vulnerability Type (CWE)")
-    plt.xlabel("Percentage of Commits")
+    plt.axvline(x=0, color='blue', linestyle='--', linewidth=1, label='Neutral')
+    plt.yticks(y_pos, labels, fontsize=11)
+    plt.xlabel("Hedges' g (Effect Size)\nPositive = Increase | Negative = Savings", fontsize=10)
+    plt.title("RQ1: Energy Impact by Project & Overall", fontsize=14, fontweight='bold')
+    plt.gca().invert_yaxis()
+    plt.grid(axis='x', linestyle='--', alpha=0.5)
     plt.tight_layout()
-    plt.savefig(HEATMAP_FILE, dpi=300)
+    plt.savefig(os.path.join(OUTPUT_DIR, "RQ1_Multi_Project.png"), dpi=300)
     plt.close()
 
 def generate_beta_plot(results_df):
-    """Generates a Forest Plot of Regression Betas (RQ3)."""
-    print("    [+] Generating Regression Beta Plot (RQ3)...")
-    
-    # Sort by coefficient value for cleaner plot
+    print("    [+] Generating RQ2 Regression Plot...")
     results_df = results_df.sort_values(by='coef', ascending=True)
-    results_df['label'] = results_df.index
+    plot_df = results_df[~results_df.index.str.contains("project", case=False)]
     
-    plt.figure(figsize=(10, 6))
+    plt.figure(figsize=(10, 8))
+    y_err = [plot_df['coef'] - plot_df['ci_lower'], plot_df['ci_upper'] - plot_df['coef']]
     
-    # Error bars format: [[lower_errors], [upper_errors]]
-    y_err = [
-        results_df['coef'] - results_df['ci_lower'], 
-        results_df['ci_upper'] - results_df['coef']
-    ]
+    plt.errorbar(x=plot_df['coef'], y=plot_df.index, xerr=y_err, 
+                 fmt='o', color='black', ecolor='red', capsize=5)
     
-    plt.errorbar(x=results_df['coef'], y=results_df['label'], xerr=y_err, 
-                 fmt='o', color='black', ecolor='red', capsize=5, label='Beta (Impact)')
-    
-    plt.axvline(x=0, color='blue', linestyle='--', linewidth=1, label='Neutral (0)')
-    
-    plt.title("RQ3: Regression Analysis (Energy Impact per CWE)")
-    plt.xlabel("Energy Impact (Hedges' g)\nPositive = Increases Energy | Negative = Saves Energy")
-    plt.ylabel("Vulnerability Type")
-    plt.grid(axis='x', linestyle='--', alpha=0.7)
-    plt.tight_layout()
-    plt.savefig(BETA_PLOT_FILE, dpi=300)
-    plt.close()
-
-def generate_rq1_plot(g_global, ci_lower, ci_upper):
-    """Generates a Single Point Plot for RQ1 (Overall Impact)."""
-    print("    [+] Generating RQ1 Global Impact Plot...")
-    
-    plt.figure(figsize=(8, 3))
-    
-    # Calculate error lengths for matplotlib
-    x_err = [[g_global - ci_lower], [ci_upper - g_global]]
-    
-    # Plot the point
-    plt.errorbar(x=g_global, y=[0], xerr=x_err, 
-                 fmt='D', markersize=10, color='black', ecolor='red', 
-                 capsize=10, elinewidth=2, label='Global Weighted Mean')
-    
-    # Add Neutral Line
-    plt.axvline(x=0, color='blue', linestyle='--', linewidth=1.5, label='Neutral (0)')
-    
-    # Formatting
-    plt.yticks([]) # Hide Y-axis ticks
-    plt.ylabel("All Commits")
-    plt.xlabel("Global Hedges' g (Effect Size)\nPositive = Increases Energy | Negative = Saves Energy")
-    plt.title(f"RQ1: Overall Energy Impact of Vulnerability Fixes\n(g = {g_global:.3f}, 95% CI: [{ci_lower:.3f}, {ci_upper:.3f}])")
-    
-    # Add text annotation
-    verdict = "NEUTRAL" if (ci_lower <= 0 <= ci_upper) else ("INCREASE" if g_global > 0 else "DECREASE")
-    color = "green" if verdict == "NEUTRAL" else "red"
-    
-    plt.text(g_global, 0.1, f"Verdict: {verdict}", 
-             ha='center', va='bottom', fontsize=12, fontweight='bold', color=color)
-
+    plt.axvline(x=0, color='blue', linestyle='--')
+    plt.title("RQ2: Regression Analysis (Pooled Data)", fontsize=14)
+    plt.xlabel("Energy Cost (Beta Coefficient)", fontsize=12)
     plt.grid(axis='x', linestyle='--', alpha=0.5)
-    plt.ylim(-0.5, 0.5) # Center the dot vertically
     plt.tight_layout()
-    plt.savefig(RQ1_PLOT_FILE, dpi=300)
+    plt.savefig(os.path.join(OUTPUT_DIR, "RQ2_Regression.png"), dpi=300)
     plt.close()
 
 # ==========================================
 # MAIN
 # ==========================================
-
 def main():
     print("="*60)
-    print("STARTING META-ANALYSIS & VISUALIZATION PIPELINE")
+    print("MULTI-PROJECT ANALYSIS PIPELINE")
     print("="*60)
-
-    # 1. Load Data
-    input_path = None
-    for p in POSSIBLE_PATHS:
-        if os.path.exists(p):
-            input_path = p
-            break
-    if not input_path:
-        print(f"[!] ERROR: Could not find input CSV.")
+    
+    all_commits_df = pd.DataFrame()
+    project_rq1_results = {}
+    
+    # 1. FIND AND LOAD CSVs
+    search_path = os.path.join(SEARCH_ROOT_DIR, FILE_PATTERN)
+    csv_files = glob.glob(search_path, recursive=True)
+    
+    if not csv_files:
+        print(f"[!] ERROR: No CSV files found matching '{search_path}'")
+        print(f"    Check that your 'final_results' folder exists and contains '_final_pertest.csv' files.")
         return
-    
-    df = pd.read_csv(input_path)
-    # Extract base testname (remove suffixes if present)
-    df['base_testname'] = df['vuln_testname'].astype(str).apply(lambda x: x.rsplit('_', 1)[0])
-    df['cwe'] = df['cwe'].fillna('Unknown')
+
+    print(f"[+] Found {len(csv_files)} project file(s).")
+
+    for filepath in csv_files:
+        filename = os.path.basename(filepath)
+        project_name = filename.split('_')[0] 
+        print(f"\n[+] Processing Project: {project_name} ({filename})")
+        
+        try:
+            df = pd.read_csv(filepath)
+            
+            if 'vuln_energy_pkg' not in df.columns:
+                print(f"    [!] SKIPPING: File missing 'vuln_energy_pkg' column.")
+                continue
+
+            if 'cwe' not in df.columns: df['cwe'] = 'Unknown'
+            df['cwe'] = df['cwe'].fillna('Unknown')
+            
+            df['base_testname'] = df['vuln_testname'].astype(str).apply(lambda x: x.rsplit('_', 1)[0])
+            
+            # -------------------------------------------------
+            # FIX 1: Add include_groups=False
+            # -------------------------------------------------
+            grouped = df.groupby(['vuln_commit', 'fix_commit', 'base_testname', 'cwe'])
+            stats_df = grouped.apply(analyze_test_raw, include_groups=False).reset_index()
+            
+            # -------------------------------------------------
+            # FIX 2: Add include_groups=False
+            # -------------------------------------------------
+            commit_grouped = stats_df.groupby(['vuln_commit', 'cwe'])
+            commit_stats = commit_grouped.apply(aggregate_commit, include_groups=False).reset_index()
+            
+            commit_stats['project'] = project_name 
+            
+            # C. Store for Global Analysis
+            all_commits_df = pd.concat([all_commits_df, commit_stats], ignore_index=True)
+            
+            # D. Calculate RQ1 for THIS Project
+            valid_commits = commit_stats[commit_stats['se_commit'] > 1e-9]
+            if not valid_commits.empty:
+                w = 1.0 / (valid_commits['se_commit'] ** 2)
+                g_proj = np.sum(w * valid_commits['g_commit']) / np.sum(w)
+                se_proj = np.sqrt(1.0 / np.sum(w))
+                
+                project_rq1_results[project_name] = {
+                    'g': g_proj, 
+                    'ci_lower': g_proj - 1.96*se_proj, 
+                    'ci_upper': g_proj + 1.96*se_proj
+                }
+                print(f"    -> Project Mean g: {g_proj:.4f}")
+        except Exception as e:
+            print(f"    [!] Error processing file: {e}")
+
+    if all_commits_df.empty:
+        print("[!] No valid data found. Exiting.")
+        return
 
     # ---------------------------------------------------------
-    # STAGE 1: Per-Test Analysis
+    # STAGE 2: GLOBAL RQ1 (OVERALL)
     # ---------------------------------------------------------
-    print("[1/3] Running Per-Test Analysis...")
-    cols_needed = ['vuln_energy_pkg', 'fix_energy_pkg']
+    print("\n[+] Calculating OVERALL Global Impact...")
+    valid_all = all_commits_df[all_commits_df['se_commit'] > 1e-9]
     
-    # Apply raw analysis
-    grouped = df.groupby(['vuln_commit', 'fix_commit', 'base_testname', 'cwe'])[cols_needed]
-    stats_df = grouped.apply(analyze_test_raw).reset_index()
-    stats_df.to_csv(DETAILED_OUTPUT, index=False)
-
-    # ---------------------------------------------------------
-    # STAGE 2: Per-Commit Aggregation
-    # ---------------------------------------------------------
-    print("\n[2/3] Aggregating Results per Commit...")
-    
-    commit_grouped = stats_df.groupby(['vuln_commit', 'cwe'])
-    commit_stats = commit_grouped.apply(aggregate_commit).reset_index()
-    
-    # Classify based on CI
-    def classify_commit(row):
-        if row['ci_lower'] > 0: return "Increase"
-        if row['ci_upper'] < 0: return "Decrease"
-        return "Neutral"
-
-    commit_stats['result_class'] = commit_stats.apply(classify_commit, axis=1)
-    
-    # Save Full Commit Stats
-    commit_stats.to_csv(COMMIT_OUTPUT, index=False)
-    print(f"      -> Commit-level stats saved to: {COMMIT_OUTPUT}")
-
-    # ---------------------------------------------------------
-    # STAGE 2.5: GLOBAL AGGREGATION (RQ1 ANSWER)
-    # ---------------------------------------------------------
-    print("\n[2.5] Calculating Global Weighted Mean (RQ1)...")
-    
-    # Filter valid commits (avoid division by zero if se_commit is 0)
-    valid_commits = commit_stats[commit_stats['se_commit'] > 1e-9].copy()
-    
-    if not valid_commits.empty:
-        # Inverse-Variance Weighting across ALL commits
-        weights = 1.0 / (valid_commits['se_commit'] ** 2)
-        sum_w = np.sum(weights)
+    if not valid_all.empty:
+        w_all = 1.0 / (valid_all['se_commit'] ** 2)
+        g_overall = np.sum(w_all * valid_all['g_commit']) / np.sum(w_all)
+        se_overall = np.sqrt(1.0 / np.sum(w_all))
         
-        g_global = np.sum(weights * valid_commits['g_commit']) / sum_w
-        se_global = np.sqrt(1.0 / sum_w)
+        project_rq1_results['OVERALL'] = {
+            'g': g_overall,
+            'ci_lower': g_overall - 1.96*se_overall,
+            'ci_upper': g_overall + 1.96*se_overall
+        }
         
-        ci_lower_global = g_global - (1.96 * se_global)
-        ci_upper_global = g_global + (1.96 * se_global)
-        
-        print(f"      -> Global g: {g_global:.4f}")
-        print(f"      -> 95% CI: [{ci_lower_global:.4f}, {ci_upper_global:.4f}]")
-        
-        # GENERATE RQ1 PLOT
-        generate_rq1_plot(g_global, ci_lower_global, ci_upper_global)
+        generate_rq1_multi_plot(project_rq1_results)
     else:
-        print("      [!] No valid commits found for Global Aggregation.")
+        print("[!] Not enough valid data for global analysis.")
 
     # ---------------------------------------------------------
-    # STAGE 3: Weighted Regression & Visualization
+    # STAGE 3: IDENTIFYING & MAPPING RARE CWEs
     # ---------------------------------------------------------
-    print("\n[3/3] Running CWE Regression Analysis & Visualization...")
+    print("\n[+] Identifying Rare CWEs...")
     
-    # Prepare Data for Heatmap: Group Rare CWEs
-    cwe_counts = commit_stats['cwe'].value_counts()
-    rare_cwes = cwe_counts[cwe_counts < MIN_COMMITS_THRESHOLD].index
+    # 1. Identify which CWEs are rare
+    cwe_counts = all_commits_df['cwe'].value_counts()
+    rare_cwes = cwe_counts[cwe_counts < MIN_COMMITS_THRESHOLD].index.tolist()
     
-    # Create a copy for visualization so we don't mess up the raw data for regression
-    viz_df = commit_stats.copy()
-    viz_df.loc[viz_df['cwe'].isin(rare_cwes), 'cwe'] = 'Other'
-    
-    # GENERATE HEATMAP
-    generate_commit_heatmap(viz_df)
+    print(f"    -> Threshold: < {MIN_COMMITS_THRESHOLD} commits")
+    print(f"    -> Rare CWEs identified: {len(rare_cwes)} types")
 
-    # Prepare Data for Regression: (Use viz_df to keep 'Other' grouping or commit_stats for full?)
-    # Usually better to use the grouped version to avoid noisy singletons
-    X = pd.get_dummies(viz_df['cwe'], dtype=float)
-    y = viz_df['g_commit']
-    se = viz_df['se_commit'].replace(0, 1e-9)
-    weights = 1.0 / (se ** 2)
+    # 2. GENERATE MAPPING FILE (Row-by-Row)
+    other_mapping_df = all_commits_df[all_commits_df['cwe'].isin(rare_cwes)].copy()
+    
+    # Use vuln_commit as the identifier since that's what we grouped by
+    mapping_output_cols = ['project', 'vuln_commit', 'cwe', 'g_commit']
+    # Ensure columns exist before selecting
+    available_cols = [c for c in mapping_output_cols if c in other_mapping_df.columns]
+    other_mapping_df = other_mapping_df[available_cols].sort_values(by=['project', 'cwe'])
+    
+    mapping_file = os.path.join(OUTPUT_DIR, "cwe_other_mapping.csv")
+    other_mapping_df.to_csv(mapping_file, index=False)
+    print(f"    -> Detailed mapping saved to: {mapping_file}")
+
+    # 3. GENERATE SUMMARY TEXT
+    summary_file = os.path.join(OUTPUT_DIR, "cwe_other_summary.txt")
+    with open(summary_file, "w") as f:
+        f.write("SUMMARY OF 'OTHER' CATEGORY COMPOSITION\n")
+        f.write("=======================================\n\n")
+        
+        for proj in other_mapping_df['project'].unique():
+            f.write(f"Project: {proj}\n")
+            f.write(f"{'-'*len(proj)}\n")
+            
+            proj_data = other_mapping_df[other_mapping_df['project'] == proj]
+            counts = proj_data['cwe'].value_counts()
+            
+            for cwe_name, count in counts.items():
+                f.write(f"  - {cwe_name}: {count} commit(s)\n")
+            f.write("\n")
+            
+    print(f"    -> Summary text saved to: {summary_file}")
+
+    # 4. Apply Grouping for Regression
+    regression_df = all_commits_df.copy()
+    regression_df.loc[regression_df['cwe'].isin(rare_cwes), 'cwe'] = 'Other'
+
+    # ---------------------------------------------------------
+    # STAGE 4: RQ2 REGRESSION (POOLED)
+    # ---------------------------------------------------------
+    print("\n[+] Running RQ2 Regression on Pooled Data...")
+    
+    # Dummies: CWE + Project (Control)
+    X = pd.get_dummies(regression_df['cwe'], dtype=float)
+    
+    # Control for Project (Drop first to avoid collinearity)
+    proj_dummies = pd.get_dummies(regression_df['project'], prefix='project', drop_first=True, dtype=float)
+    X = pd.concat([X, proj_dummies], axis=1)
+
+    y = regression_df['g_commit']
+    weights = 1.0 / (regression_df['se_commit'].replace(0, 1e-9) ** 2)
     
     try:
         model = sm.WLS(y, X, weights=weights)
         results = model.fit()
         
-        print("\n" + "="*60)
-        print("WEIGHTED REGRESSION RESULTS (Beta)")
-        print("="*60)
         print(results.summary())
         
-        # Save results
         results_df = pd.DataFrame({
             'coef': results.params,
             'ci_lower': results.conf_int()[0],
             'ci_upper': results.conf_int()[1]
         })
-        results_df.to_csv(REGRESSION_OUTPUT)
+        results_df.to_csv(os.path.join(OUTPUT_DIR, "RQ2_Regression_Results.csv"))
         
-        # GENERATE BETA PLOT (RQ3)
         generate_beta_plot(results_df)
         
     except Exception as e:
-        print(f"[!] Regression failed: {e}")
+        print(f"[!] Regression Failed: {e}")
 
-    print(f"\n[+] PIPELINE COMPLETE. Visualizations saved in: {OUTPUT_DIR}")
+    print(f"\n[+] DONE. Results saved in: {OUTPUT_DIR}")
 
 if __name__ == "__main__":
     main()
