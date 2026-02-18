@@ -8,7 +8,7 @@ import sys
 # ==========================================
 # CONFIGURATION
 # ==========================================
-PROJECT_NAME = "vim"
+PROJECT_NAME = "libxml2"
 GIST_CSV_URL = "https://gist.githubusercontent.com/waheed-sep/935cfc1ba42b2475d45336a4c779cbc8/raw/cwe_projects.csv"
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 INPUT_DIR = os.path.join(BASE_DIR, "final_eng_csvs", PROJECT_NAME, "energy_measurements")
